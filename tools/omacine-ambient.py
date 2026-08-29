@@ -147,9 +147,13 @@ def main():
                     help="0..1; lower is calmer. Stops cuts strobing.")
     ap.add_argument("--deadzone", type=int, default=6,
                     help="ignore colour changes smaller than this per channel")
-    ap.add_argument("--cut-mode", action="store_true",
-                    help="only change colour on a real scene change, so the "
-                         "firmware's flash is hidden by the cut itself")
+    # On by default: it is the only setting where the firmware's flash is not
+    # objectionable, so it is what the tool should do unless asked otherwise.
+    ap.add_argument("--smooth-mode", dest="cut_mode", action="store_false",
+                    help="update continuously instead of only on scene changes. "
+                         "Tracks the picture more closely, but every write makes "
+                         "the LEDs blink, so this visibly flickers.")
+    ap.set_defaults(cut_mode=True)
     ap.add_argument("--min-interval", type=float, default=0.12,
                     help="seconds between hardware writes; every write re-applies "
                          "the Static mode and the firmware can flash doing it")
@@ -188,7 +192,7 @@ def main():
     interval = 1.0 / max(0.5, args.fps)
     print(f"ambient: {args.fps:g} fps, smoothing {args.smooth}, "
           f"deadzone {args.deadzone}, min interval {args.min_interval}s"
-          + ("  [cut mode]" if args.cut_mode else ""))
+          + ("  [cut mode]" if args.cut_mode else "  [continuous - expect flicker]"))
     print("Ctrl-C to stop")
     while True:
         start = time.time()
