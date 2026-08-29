@@ -12,6 +12,18 @@ Why it works the way it does, on a ROG Strix G512LW:
     So this drives one colour for the whole machine rather than a left-to-right
     gradient - a gradient would light the keys and leave the bar dark.
 
+  * Every write to the Aura effect makes the LEDs blink: setting LedModeData
+    re-applies the Static *mode*, and the firmware re-initialises the effect
+    visibly. There is no colour-only property on the interface, and per-key
+    Direct addressing - the one path that does not re-apply a mode - does not
+    reach the light bar. This is a documented ROG-on-Linux limitation, not
+    something the script can work around.
+
+    So the strategy is to write RARELY and to write WHEN IT IS MASKED. A flash
+    that lands on a scene cut is invisible, because the screen was changing
+    anyway. --cut-mode leans all the way into that: it holds a colour until the
+    scene genuinely changes, then moves.
+
   * Capture is full-resolution grim. `grim -s` scales in software and measured
     5x SLOWER than capturing full frames and reducing them here.
   * Every pixel of a sampled row is averaged, not a sparse grid. A grid lands on
@@ -135,6 +147,9 @@ def main():
                     help="0..1; lower is calmer. Stops cuts strobing.")
     ap.add_argument("--deadzone", type=int, default=6,
                     help="ignore colour changes smaller than this per channel")
+    ap.add_argument("--cut-mode", action="store_true",
+                    help="only change colour on a real scene change, so the "
+                         "firmware's flash is hidden by the cut itself")
     ap.add_argument("--min-interval", type=float, default=0.12,
                     help="seconds between hardware writes; every write re-applies "
                          "the Static mode and the firmware can flash doing it")
@@ -159,11 +174,22 @@ def main():
     signal.signal(signal.SIGINT, restore)
     signal.signal(signal.SIGTERM, restore)
 
+    # Writing is what flickers, so cut-mode writes as seldom as possible and
+    # lets each flash coincide with a cut. Snappier smoothing is fine here:
+    # between writes nothing reaches the hardware anyway.
+    if args.cut_mode:
+        args.deadzone = max(args.deadzone, 26)
+        args.min_interval = max(args.min_interval, 0.8)
+        args.smooth = max(args.smooth, 0.5)
+
     smoothed = None
     last_sent = (-99, -99, -99)
     last_write = 0.0
     interval = 1.0 / max(0.5, args.fps)
-    print(f"ambient: {args.fps:g} fps, smoothing {args.smooth}, Ctrl-C to stop")
+    print(f"ambient: {args.fps:g} fps, smoothing {args.smooth}, "
+          f"deadzone {args.deadzone}, min interval {args.min_interval}s"
+          + ("  [cut mode]" if args.cut_mode else ""))
+    print("Ctrl-C to stop")
     while True:
         start = time.time()
         region = mpv_geometry()
