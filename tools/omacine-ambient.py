@@ -133,8 +133,11 @@ def main():
     ap.add_argument("--fps", type=float, default=12.0)
     ap.add_argument("--smooth", type=float, default=0.18,
                     help="0..1; lower is calmer. Stops cuts strobing.")
-    ap.add_argument("--deadzone", type=int, default=3,
+    ap.add_argument("--deadzone", type=int, default=6,
                     help="ignore colour changes smaller than this per channel")
+    ap.add_argument("--min-interval", type=float, default=0.12,
+                    help="seconds between hardware writes; every write re-applies "
+                         "the Static mode and the firmware can flash doing it")
     ap.add_argument("--saturation", type=float, default=1.7)
     ap.add_argument("--step", type=int, default=8, help="row sampling stride")
     ap.add_argument("--follow-mpv", action="store_true",
@@ -158,6 +161,7 @@ def main():
 
     smoothed = None
     last_sent = (-99, -99, -99)
+    last_write = 0.0
     interval = 1.0 / max(0.5, args.fps)
     print(f"ambient: {args.fps:g} fps, smoothing {args.smooth}, Ctrl-C to stop")
     while True:
@@ -174,16 +178,20 @@ def main():
             if smoothed is None:
                 smoothed = target
                 set_colour(*smoothed)
-                last_sent = smoothed
+                last_sent, last_write = smoothed, time.time()
             else:
                 a = args.smooth
                 smoothed = tuple(int(s + (t - s) * a) for s, t in zip(smoothed, target))
-                # Only talk to the hardware when the change is visible. Below
-                # this the LED cannot show a difference anyway, and every write
-                # is a round trip.
-                if max(abs(c - p) for c, p in zip(smoothed, last_sent)) >= args.deadzone:
+                # Two gates before touching the hardware. Sampling is stable now,
+                # so the remaining flicker comes from the writes themselves: each
+                # one re-applies the Static effect mode, and the firmware can
+                # blink as it does. Write only on a visible change, and never
+                # faster than min-interval.
+                moved = max(abs(c - p) for c, p in zip(smoothed, last_sent))
+                due = (time.time() - last_write) >= args.min_interval
+                if moved >= args.deadzone and due:
                     set_colour(*smoothed)
-                    last_sent = smoothed
+                    last_sent, last_write = smoothed, time.time()
         if args.once:
             print("colour:", smoothed)
             return 0
