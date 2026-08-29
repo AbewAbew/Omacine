@@ -1,0 +1,14 @@
+.runtime/
+.runtime/python/
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+bridge/python/__pycache__/
+bridge/__pycache__/
+# cache
+.mypy_cache/
+.pytest_cache/

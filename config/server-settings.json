@@ -1,0 +1,23 @@
+{
+  "serverVersion": "4.20.17",
+  "appPath": "",
+  "cacheRoot": "",
+  "cacheSize": 10737418240,
+  "btMaxConnections": 80,
+  "btHandshakeTimeout": 8000,
+  "btRequestTimeout": 2500,
+  "btDownloadSpeedSoftLimit": 20971520,
+  "btDownloadSpeedHardLimit": 52428800,
+  "btMinPeersForStable": 3,
+  "remoteHttps": "",
+  "localAddonEnabled": false,
+  "transcodeHorsepower": 0.75,
+  "transcodeMaxBitRate": 0,
+  "transcodeConcurrency": 1,
+  "transcodeTrackConcurrency": 1,
+  "transcodeHardwareAccel": false,
+  "transcodeProfile": null,
+  "allTranscodeProfiles": [],
+  "transcodeMaxWidth": 1920,
+  "proxyStreamsEnabled": false
+}

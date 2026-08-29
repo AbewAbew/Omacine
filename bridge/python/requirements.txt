@@ -1,0 +1,2 @@
+# MovieBox can fall back to urllib, but 4KHDHub mirror resolution uses requests.
+requests>=2.28

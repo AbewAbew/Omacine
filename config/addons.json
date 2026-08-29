@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 2,
+  "metadataManifest": "",
+  "streamingServer": "http://127.0.0.1:11470",
+  "cacheSizeBytes": 10737418240,
+  "builtinFreeMedia": true,
+  "builtinFreeResolver": true,
+  "resolverManifests": [],
+  "addons": [
+    {
+      "name": "Public Domain Movies",
+      "manifestUrl": "https://caching.stremio.net/publicdomainmovies.now.sh/manifest.json",
+      "enabled": true
+    },
+    {
+      "name": "Stremio Local Files",
+      "manifestUrl": "http://127.0.0.1:11470/local-addon/manifest.json",
+      "enabled": true
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "tenzin.omamovie",
+  "name": "OmaCine",
+  "version": "2.1.0",
+  "author": "tenzin",
+  "description": "A cinematic Omarchy media hub with TMDB discovery, personal library, intelligent episode continuity, and community catalog streaming.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  }
+}

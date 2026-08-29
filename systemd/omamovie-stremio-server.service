@@ -1,0 +1,13 @@
+[Unit]
+Description=OmaCine streaming cache
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.config/omarchy/plugins/tenzin.omamovie/bridge/stremio-server-wrapper.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

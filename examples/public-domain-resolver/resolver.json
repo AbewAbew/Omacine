@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "org.omamovie.example.public-domain",
+  "name": "OmaCine Public Domain Example",
+  "description": "Static ID aliases for Creative Commons and public-domain test media.",
+  "mappings": [
+    {
+      "type": "movie",
+      "from": "omamovie:catalog:sintel",
+      "to": "omamovie:free:sintel"
+    }
+  ]
+}
