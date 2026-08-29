@@ -52,6 +52,18 @@ def busctl(args):
     return subprocess.run(["busctl", "--system"] + args, capture_output=True, text=True)
 
 
+def read_brightness():
+    out = busctl(["get-property", AURA_SERVICE, AURA_PATH, AURA_IFACE, "Brightness"]).stdout
+    try:
+        return int(out.split()[-1])
+    except (IndexError, ValueError):
+        return None
+
+
+def set_brightness(level):
+    busctl(["set-property", AURA_SERVICE, AURA_PATH, AURA_IFACE, "Brightness", "u", str(level)])
+
+
 def read_mode():
     out = busctl(["get-property", AURA_SERVICE, AURA_PATH, AURA_IFACE, "LedModeData"]).stdout
     parts = out.split()
@@ -161,6 +173,8 @@ def main():
     ap.add_argument("--step", type=int, default=8, help="row sampling stride")
     ap.add_argument("--follow-mpv", action="store_true",
                     help="only light up while an mpv window exists")
+    ap.add_argument("--brightness", type=int, default=2, choices=[1, 2, 3],
+                    help="brightness to use if the LEDs were off when we started")
     ap.add_argument("--once", action="store_true", help="one frame, then exit")
     args = ap.parse_args()
 
@@ -169,10 +183,19 @@ def main():
         print("could not read the current Aura state - is asusd running?", file=sys.stderr)
         return 1
 
+    # Brightness is saved as well as colour. Someone who keeps their LEDs off
+    # wants them off again afterwards, so lighting up has to be undone fully -
+    # restoring only the colour would leave them lit.
+    previous_brightness = read_brightness()
+    if previous_brightness is not None and previous_brightness == 0:
+        set_brightness(args.brightness)
+
     def restore(*_):
         if previous:
             set_colour(previous[2], previous[3], previous[4])
-        print("\nrestored the previous colour")
+        if previous_brightness is not None:
+            set_brightness(previous_brightness)
+        print("\nrestored the previous lighting")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, restore)

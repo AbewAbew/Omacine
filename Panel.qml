@@ -3377,6 +3377,9 @@ Panel {
 
     function close() {
         root.stopTheme();
+        // Lighting belongs to OmaCine being open, not to the process outliving
+        // it: closing the panel puts the LEDs back however they were.
+        root.stopAmbient();
         if (root.view === "player") { root.stopEmbedded(); root.playerFullscreen = false; }
         root.controller.hide();
     }
