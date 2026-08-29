@@ -231,7 +231,8 @@ Panel {
         reviewOpacity: 0.94,
         cachePostersMB: 200,
         cacheThemesMB: 800,
-        cacheTorrentGB: 11
+        cacheTorrentGB: 11,
+        cinematicMode: false
     })
     property var cacheUsage: []
     property bool cacheBusy: false
@@ -2095,6 +2096,8 @@ Panel {
     }
 
     function addResumeArgument(args) {
+        // Applies to the whole playlist, not just this file - queued episodes
+        // pass their own start=0 to override it. See nextStreamOptions().
         if (root.playbackPosition >= 15) args.push("--start=" + Math.floor(root.playbackPosition));
     }
 
@@ -2258,7 +2261,11 @@ Panel {
     }
 
     function nextStreamOptions(stream) {
-        var options = { "force-media-title": root.mediaTitle(root.nextEpisodeSeason, root.nextEpisodeNumber) };
+        // --start is a *global* mpv option: it applies to every file in the
+        // playlist, so resuming this episode at 10:00 also started the next one
+        // at 10:00. A per-file start of 0 overrides it for the queued entry.
+        var options = { "force-media-title": root.mediaTitle(root.nextEpisodeSeason, root.nextEpisodeNumber),
+                        "start": "0" };
         var fields = [];
         var headers = stream.headers || [];
         for (var i = 0; i < headers.length; i++) {
@@ -2615,6 +2622,40 @@ Panel {
             root.startThemeFor(wanted);
         }
     }
+
+    // ---- cinematic mode ----
+    // Ambient lighting that follows the picture, on the laptop's own LEDs.
+    // Runs only while something is playing, and only when switched on: the
+    // helper restores the previous colour when it is stopped.
+    readonly property string ambientTool:
+        Qt.resolvedUrl("tools/omacine-ambient.py").toString().replace(/^file:\/\//, "")
+
+    Process {
+        id: ambientProc
+        onExited: function() { root.ambientRunning = false; }
+    }
+    property bool ambientRunning: false
+
+    function startAmbient() {
+        if (root.ambientRunning || root.settings.cinematicMode !== true) return;
+        ambientProc.command = ["python3", root.ambientTool, "--follow-mpv"];
+        ambientProc.running = true;
+        root.ambientRunning = true;
+    }
+
+    function stopAmbient() {
+        // SIGTERM rather than a hard kill: the helper handles it and puts the
+        // previous colour back.
+        if (ambientProc.running) ambientProc.signal(15);
+        root.ambientRunning = false;
+    }
+
+    function syncAmbient() {
+        if (root.settings.cinematicMode === true && root.playing) root.startAmbient();
+        else root.stopAmbient();
+    }
+
+    onPlayingChanged: root.syncAmbient()
 
     Process {
         id: mpvProc
@@ -3614,6 +3655,24 @@ Panel {
                 iconText: "\uf133"
                 selected: root.view === "calendar" && !root.addonManagerOpen
                 onClicked: root.openCalendar(false)
+            }
+            Button {
+                text: "Cinematic"
+                iconText: "\uf0eb"
+                tooltipText: root.settings.cinematicMode === true
+                    ? "Ambient lighting follows the picture while you watch"
+                    : "Light the keyboard and underglow to match what is playing"
+                selected: root.settings.cinematicMode === true
+                onClicked: {
+                    var next = root.settings.cinematicMode !== true;
+                    root.updateSetting("cinematicMode", next);
+                    // updateSetting is optimistic, so the local value is already
+                    // correct and this can act on it immediately.
+                    root.syncAmbient();
+                    root.statusText = next
+                        ? "Cinematic mode on \u2014 lighting follows playback"
+                        : "Cinematic mode off";
+                }
             }
             TextField {
                 id: searchField

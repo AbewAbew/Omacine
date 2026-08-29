@@ -268,6 +268,9 @@ SETTINGS_SCHEMA = {
     "cachePostersMB":    (200, 50, 4000),
     "cacheThemesMB":     (800, 100, 8000),
     "cacheTorrentGB":    (11, 1, 200),
+    # Ambient keyboard/underglow lighting during playback. Off by default: it
+    # drives the laptop's LEDs, which is not something to switch on unasked.
+    "cinematicMode":     (False, None, None),
 }
 
 
@@ -547,7 +550,9 @@ def _validated_mpv_commands(value) -> list[list]:
             if len(command) != 5 or command[2] != "insert-next" or command[3] != -1 or not isinstance(command[4], dict):
                 raise ValueError("invalid playlist item")
             options = command[4]
-            if set(options) - {"force-media-title", "http-header-fields"} or not all(isinstance(value, str) for value in options.values()):
+            # "start" is allowed so a queued episode can override the global
+            # --start used to resume the current one.
+            if set(options) - {"force-media-title", "http-header-fields", "start"} or not all(isinstance(value, str) for value in options.values()):
                 raise ValueError("unsupported playlist option")
         elif name == "sub-add" and (len(command) not in (2, 3) or (len(command) == 3 and command[2] not in ("auto", "select"))):
             raise ValueError("invalid subtitle command")
