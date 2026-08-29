@@ -13,7 +13,13 @@ Why it works the way it does, on a ROG Strix G512LW:
     gradient - a gradient would light the keys and leave the bar dark.
 
   * Capture is full-resolution grim. `grim -s` scales in software and measured
-    5x SLOWER than capturing full frames and sampling sparsely here.
+    5x SLOWER than capturing full frames and reducing them here.
+  * Every pixel of a sampled row is averaged, not a sparse grid. A grid lands on
+    different content each frame, so the average jitters by ~19 levels even on a
+    completely static screen - visible flicker that no amount of temporal
+    smoothing can remove, because it is noise rather than signal. Averaging
+    whole rows drops that to ~1. Rows may still be skipped: each sampled row is
+    itself a complete average, so coverage stays even.
 
 Run it while something is playing. Ctrl-C restores the previous colour.
 """
@@ -76,24 +82,31 @@ def capture(region):
     return out if out.startswith(b"P6") else None
 
 
-def frame_colour(raw, step=24, dark=24):
-    """One representative colour: sparse average, ignoring letterbox black."""
+def frame_colour(raw, row_step=8, dark=24):
+    """One representative colour, averaging every pixel of the sampled rows.
+
+    Whole-row sums via slice arithmetic; a sparse x-grid is what caused the
+    flicker. Letterbox rows are dropped wholesale rather than per pixel, which
+    is both faster and more correct: a bar is a property of the row.
+    """
     head = raw.split(b"\n", 3)
     try:
         w, h = map(int, head[1].split())
         body = head[3]
     except (IndexError, ValueError):
         return None
-    rowb, rs, gs, bs, n = w * 3, 0, 0, 0, 0
-    for y in range(0, h, step):
-        base = y * rowb
-        for x in range(0, w, step):
-            i = base + x * 3
-            r, g, b = body[i], body[i + 1], body[i + 2]
-            # Letterbox bars and near-black pixels drag everything to grey.
-            if r + g + b < dark * 3:
-                continue
-            rs += r; gs += g; bs += b; n += 1
+    rowb = w * 3
+    rs = gs = bs = n = 0
+    floor = dark * w          # a row this dark overall is letterboxing
+    for y in range(0, h, row_step):
+        start = y * rowb
+        row = body[start:start + rowb]
+        if len(row) < rowb:
+            break
+        r = sum(row[0::3]); g = sum(row[1::3]); b = sum(row[2::3])
+        if r + g + b < floor * 3:
+            continue
+        rs += r; gs += g; bs += b; n += w
     if not n:
         return (0, 0, 0)
     return (rs // n, gs // n, bs // n)
@@ -118,10 +131,12 @@ def punch(rgb, saturation=1.7, floor=28, ceiling=255):
 def main():
     ap = argparse.ArgumentParser(description="Ambient lighting from the video on screen")
     ap.add_argument("--fps", type=float, default=12.0)
-    ap.add_argument("--smooth", type=float, default=0.25,
+    ap.add_argument("--smooth", type=float, default=0.18,
                     help="0..1; lower is calmer. Stops cuts strobing.")
+    ap.add_argument("--deadzone", type=int, default=3,
+                    help="ignore colour changes smaller than this per channel")
     ap.add_argument("--saturation", type=float, default=1.7)
-    ap.add_argument("--step", type=int, default=24, help="pixel sampling stride")
+    ap.add_argument("--step", type=int, default=8, help="row sampling stride")
     ap.add_argument("--follow-mpv", action="store_true",
                     help="only light up while an mpv window exists")
     ap.add_argument("--once", action="store_true", help="one frame, then exit")
@@ -142,6 +157,7 @@ def main():
     signal.signal(signal.SIGTERM, restore)
 
     smoothed = None
+    last_sent = (-99, -99, -99)
     interval = 1.0 / max(0.5, args.fps)
     print(f"ambient: {args.fps:g} fps, smoothing {args.smooth}, Ctrl-C to stop")
     while True:
@@ -157,10 +173,17 @@ def main():
             target = punch(frame_colour(raw, args.step) or (0, 0, 0), args.saturation)
             if smoothed is None:
                 smoothed = target
+                set_colour(*smoothed)
+                last_sent = smoothed
             else:
                 a = args.smooth
                 smoothed = tuple(int(s + (t - s) * a) for s, t in zip(smoothed, target))
-            set_colour(*smoothed)
+                # Only talk to the hardware when the change is visible. Below
+                # this the LED cannot show a difference anyway, and every write
+                # is a round trip.
+                if max(abs(c - p) for c, p in zip(smoothed, last_sent)) >= args.deadzone:
+                    set_colour(*smoothed)
+                    last_sent = smoothed
         if args.once:
             print("colour:", smoothed)
             return 0
