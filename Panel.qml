@@ -650,6 +650,23 @@ Panel {
     // Requests carry a reserved `_rid` so several can be in flight at once and
     // a slow stream scrape never blocks a poster fetch queued behind it.
     // If the daemon is unavailable the old one-shot spawn still works.
+    // One outstanding telemetry request per channel. These replace the old
+    // Process.running guards: the daemon answers several requests at once, so
+    // "is the process busy" no longer describes whether a poll is in flight.
+    property bool mpvStatusInFlight: false
+    property bool streamStatusInFlight: false
+    // Issue times, so a reply that never arrives cannot silence a channel for
+    // good. Exit and error both clear the flag; a daemon wedged without
+    // exiting clears neither, and telemetry would simply stop.
+    property double mpvStatusSentMs: 0
+    property double streamStatusSentMs: 0
+    readonly property int telemetryStallMs: 5000
+    // The stall escape above lets a second request go out while the first is
+    // still outstanding, so a generation decides which reply still owns the
+    // channel. Without it the slow first reply would clear the in-flight flag
+    // its successor is relying on, and apply the older of two samples.
+    property int mpvStatusGeneration: 0
+    property int streamStatusGeneration: 0
     property var daemonCallbacks: ({})
     property int daemonSeq: 0
     property bool daemonReady: false
@@ -2429,10 +2446,20 @@ Panel {
     }
 
     function pollStreamHealth() {
-        if (!root.streamHealthUrl || streamStatusProc.running) return;
-        streamStatusProc.collected = "";
-        streamStatusProc.command = [root.bridge, JSON.stringify({ cmd: "stream_status", url: root.streamHealthUrl })];
-        streamStatusProc.running = true;
+        if (!root.streamHealthUrl) return;
+        if (root.streamStatusInFlight
+                && Date.now() - root.streamStatusSentMs < root.telemetryStallMs) return;
+        var target = root.streamHealthUrl;
+        root.streamStatusGeneration++;
+        var generation = root.streamStatusGeneration;
+        root.streamStatusInFlight = true;
+        root.streamStatusSentMs = Date.now();
+        root.request("stream_status", { url: target }, function(resp) {
+            if (generation !== root.streamStatusGeneration) return;
+            root.streamStatusInFlight = false;
+            if (target !== root.streamHealthUrl) return;
+            root.updateStreamHealth(resp);
+        });
     }
 
     function updateStreamHealth(resp) {
@@ -2480,17 +2507,6 @@ Panel {
                                   + (attempts > 0 ? (" • " + attempts + " connection attempts") : "");
         }
         root.statusText = root.streamHealthText;
-    }
-
-    Process {
-        id: streamStatusProc
-        property string collected: ""
-        stdout: SplitParser { onRead: function(data){ streamStatusProc.collected += data } }
-        onExited: function(){
-            var resp = null;
-            try { resp = JSON.parse(streamStatusProc.collected); } catch (e) {}
-            root.updateStreamHealth(resp);
-        }
     }
 
     Timer {
@@ -2569,10 +2585,25 @@ Panel {
     }
 
     function pollMpvState() {
-        if (!root.mpvSocketPath || mpvStateProc.running) return;
-        mpvStateProc.collected = "";
-        mpvStateProc.command = [root.bridge, JSON.stringify({ cmd: "mpv_status", socketPath: root.mpvSocketPath })];
-        mpvStateProc.running = true;
+        if (!root.mpvSocketPath) return;
+        if (root.mpvStatusInFlight
+                && Date.now() - root.mpvStatusSentMs < root.telemetryStallMs) return;
+        // Captured, not read again in the callback: by the time this returns
+        // the player may have been replaced, and a reply describing the old
+        // session must not be applied to the new one.
+        var session = root.mpvSocketPath;
+        root.mpvStatusGeneration++;
+        var generation = root.mpvStatusGeneration;
+        root.mpvStatusInFlight = true;
+        root.mpvStatusSentMs = Date.now();
+        root.request("mpv_status", { socketPath: session }, function(resp) {
+            // A reply that no longer owns the channel is not merely stale: it
+            // must not free the in-flight flag its successor is holding.
+            if (generation !== root.mpvStatusGeneration) return;
+            root.mpvStatusInFlight = false;
+            if (session !== root.mpvSocketPath) return;
+            root.updateMpvState(resp);
+        });
     }
 
     function updateMpvState(resp) {
@@ -2743,27 +2774,15 @@ Panel {
         Qt.callLater(function(){ root.prepareNextEpisode(); });
     }
 
-    Process {
-        id: mpvStateProc
-        property string collected: ""
-        stdout: SplitParser { onRead: function(data){ mpvStateProc.collected += data } }
-        onExited: function(){
-            var resp = null;
-            try { resp = JSON.parse(mpvStateProc.collected); } catch (e) {}
-            root.updateMpvState(resp);
-        }
-    }
-
     Timer {
-        // Tiered, because every poll spawns a bridge process. Fast until the
-        // first frame lands (a bounded handful of polls, and the number we
-        // actually care about), then one second through the opening minute
-        // where rebuffering clusters, then back off. playbackPosition is the
-        // reactive term: Date.now() in a binding would never re-evaluate.
+        // Steady state is 500ms now that a poll costs an IPC round trip rather
+        // than a Python interpreter start. Note this improves detection but
+        // cannot make rebuffer accounting exact: a stall shorter than the
+        // interval still falls between samples. observe_property over a
+        // persistent mpv connection is the accurate answer.
         interval: root.metricFirstFrameMs <= 0
                     ? (root.metricStartupPolls < 100 ? 300 : 2000)
-                    : (root.playbackPosition < 60 ? 1000
-                                                  : (root.nextEpisodeQueued ? 1000 : 5000))
+                    : 500
         repeat: true
         running: root.playing && root.mpvSocketPath !== ""
         triggeredOnStart: true
