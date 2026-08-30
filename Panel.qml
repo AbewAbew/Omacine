@@ -277,6 +277,7 @@ Panel {
         uiFontFamily: "Adwaita Sans",
         reviewOpacity: 0.94,
         prefetchStreams: true,
+        engineReleaseGraceSeconds: 30,
         cachePostersMB: 200,
         cacheThemesMB: 800,
         cacheTorrentGB: 11,
@@ -2284,6 +2285,57 @@ Panel {
         return found ? found[1].toLowerCase() : "";
     }
 
+    // Engines outlive the player: peers stay connected and pieces keep
+    // arriving for something nobody is watching. They are released after a
+    // grace period rather than immediately, so closing and reopening within a
+    // few seconds does not have to re-find the swarm from cold.
+    //
+    // Keyed by info hash with its own deadline each, because one shared timer
+    // loses an engine in the obvious sequence: close A, play B, close B inside
+    // the grace window - B's schedule would overwrite A's and A would run on
+    // forever.
+    property var pendingReleases: ({})
+
+    function scheduleEngineRelease(link) {
+        var hash = root.infoHashOf(link);
+        if (!hash) return;
+        var grace = Number(root.settings.engineReleaseGraceSeconds);
+        if (!(grace > 0)) { root.releasePrefetch(link); return; }
+        var next = ({});
+        for (var key in root.pendingReleases) next[key] = root.pendingReleases[key];
+        next[hash] = { link: link, dueMs: Date.now() + grace * 1000 };
+        root.pendingReleases = next;
+        engineReleaseTimer.start();
+    }
+
+    // Something wants this engine again, so it is no longer going anywhere.
+    function cancelPendingRelease(link) {
+        var hash = root.infoHashOf(link);
+        if (!hash || !root.pendingReleases[hash]) return;
+        var next = ({});
+        for (var key in root.pendingReleases) if (key !== hash) next[key] = root.pendingReleases[key];
+        root.pendingReleases = next;
+    }
+
+    function sweepPendingReleases() {
+        var now = Date.now();
+        var remaining = ({});
+        var due = [];
+        for (var key in root.pendingReleases) {
+            var entry = root.pendingReleases[key];
+            if (entry && entry.dueMs <= now) due.push(entry.link);
+            else remaining[key] = entry;
+        }
+        root.pendingReleases = remaining;
+        // Through the normal queue, so the info-hash guards still apply: an
+        // engine reclaimed by playback or a warm since being scheduled is
+        // skipped there rather than torn out from under a reader.
+        for (var i = 0; i < due.length; i++) root.releasePrefetch(due[i]);
+        var empty = true;
+        for (var k in root.pendingReleases) { empty = false; break; }
+        if (empty) engineReleaseTimer.stop();
+    }
+
     function releasePrefetch(link) {
         if (!link || !root.infoHashOf(link)) return;
         if (root.releaseQueue.indexOf(link) >= 0) return;
@@ -2334,6 +2386,7 @@ Panel {
         root.prefetchLink = link;
         root.prefetchState = "warming";
         root.warmTailState = "unknown";
+        root.cancelPendingRelease(link);
         if (streamWarmProc.running) {
             // Cannot retask a running Process; start this one when it exits.
             root.pendingWarmLink = link;
@@ -2454,6 +2507,7 @@ Panel {
     }
 
     function _launch(args, link, subLabel) {
+        root.cancelPendingRelease(link);
         args.push(link);
         mpvProc.command = args;
         mpvProc.running = true;
@@ -2937,6 +2991,13 @@ Panel {
     // Long enough that arrowing through rows does not start an engine per row,
     // short enough to still cover the pause before Play is pressed.
     Timer {
+        id: engineReleaseTimer
+        interval: 1000
+        repeat: true
+        onTriggered: root.sweepPendingReleases()
+    }
+
+    Timer {
         id: streamWarmDebounce
         interval: 350
         repeat: false
@@ -3070,7 +3131,12 @@ Panel {
             root.clearPrefetch(false);
             root.queueWatchSave(false);
             root.playing = false;
+            // Captured before the guard is dropped: releasePrefetch refuses to
+            // touch streamHealthUrl, so scheduling has to happen after it is
+            // cleared, using the value it held.
+            var finished = root.streamHealthUrl;
             root.streamHealthUrl = "";
+            if (finished) root.scheduleEngineRelease(finished);
             root.streamHealthText = "";
             root.streamHealthState = "idle";
             root.streamHealthPolls = 0;
@@ -4420,6 +4486,42 @@ Panel {
                     value: Number(root.settings.cachePostersMB)
                     enabled: !root.settingsBusy
                     onMoved: function(v) { root.updateSetting("cachePostersMB", Math.round(v / 25) * 25); }
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Text {
+                        text: "Keep sources connected after closing"
+                        font.family: root.uiFont
+                        font.pixelSize: root.fs(Style.font.caption)
+                        color: Color.foreground
+                    }
+                    Item { Layout.fillWidth: true }
+                    Text {
+                        text: Number(root.settings.engineReleaseGraceSeconds) > 0
+                            ? Number(root.settings.engineReleaseGraceSeconds) + " s"
+                            : "off"
+                        font.family: root.dataFont
+                        font.pixelSize: root.fs(Style.font.caption)
+                        color: Color.accent
+                    }
+                }
+                Text {
+                    Layout.fillWidth: true
+                    text: "Reopening within this window resumes without finding sources again. "
+                        + "They keep downloading meanwhile, so set it to 0 on a metered connection."
+                    wrapMode: Text.WordWrap
+                    font.family: root.uiFont
+                    font.pixelSize: root.fs(Style.font.caption - 1)
+                    color: Qt.darker(Color.foreground, 1.45)
+                }
+                PanelSlider {
+                    Layout.fillWidth: true
+                    bar: root.bar
+                    minimum: 0; maximum: 120
+                    value: Number(root.settings.engineReleaseGraceSeconds)
+                    enabled: !root.settingsBusy
+                    onMoved: function(v) { root.updateSetting("engineReleaseGraceSeconds", Math.round(v / 5) * 5); }
                 }
 
                 RowLayout {

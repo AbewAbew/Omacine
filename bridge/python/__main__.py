@@ -277,6 +277,11 @@ SETTINGS_SCHEMA = {
     # up to a megabyte for a stream that is then not played, which is why it
     # can be turned off on a metered connection.
     "prefetchStreams":   (True, None, None),
+    # How long a torrent engine keeps running after the player closes. Engines
+    # go on talking to peers once playback stops, which on a metered link is
+    # real money: roughly 14 MiB per 30s at the rates observed here. The grace
+    # buys a fast resume for someone who closes and reopens; 0 releases at once.
+    "engineReleaseGraceSeconds": (30, 0, 120),
 }
 
 
