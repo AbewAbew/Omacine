@@ -3,6 +3,7 @@
 import sys
 import json
 import os
+import threading
 import re
 import datetime
 import hashlib
@@ -56,11 +57,22 @@ CONTINUE_WATCHING_LIMIT = 12
 HOME_SNAPSHOT_MAX_AGE = 7 * 24 * 60 * 60
 
 
+def _scratch_path(path: Path) -> Path:
+    """A temp name no other writer can collide with.
+
+    A fixed ".new" sibling is not safe here: the daemon answers on eight
+    worker threads and the one-shot fallback runs as its own process, so two
+    writers could share the path and whichever renamed second would fail with
+    ENOENT on a file the first had already moved into place.
+    """
+    return path.with_suffix(f".new-{os.getpid()}-{threading.get_ident()}-{time.time_ns()}")
+
+
 def _write_private_json(path: Path, value) -> None:
     """Persist owner-readable state atomically. Viewing history and saved
     titles are private, so the file is never briefly world-readable."""
     _STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = path.with_suffix(".new")
+    tmp = _scratch_path(path)
     handle = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
@@ -494,6 +506,9 @@ def load_settings() -> dict:
     return values
 
 
+_SETTINGS_LOCK = threading.Lock()
+
+
 def save_settings(req: dict) -> dict:
     values = req.get("values")
     if not isinstance(values, dict):
@@ -501,12 +516,17 @@ def save_settings(req: dict) -> dict:
     unknown = set(values) - set(SETTINGS_SCHEMA) - set(SETTINGS_TEXT_SCHEMA)
     if unknown:
         raise ValueError(f"unknown setting: {sorted(unknown)[0]}")
+    with _SETTINGS_LOCK:
+        return _save_settings_locked(values)
+
+
+def _save_settings_locked(values: dict) -> dict:
     merged = load_settings()
     for name, value in values.items():
         merged[name] = (_coerce_text_setting(name, value) if name in SETTINGS_TEXT_SCHEMA
                         else _coerce_setting(name, value))
     _SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = _SETTINGS_FILE.with_suffix(".new")
+    tmp = _scratch_path(_SETTINGS_FILE)
     tmp.write_text(json.dumps(merged, separators=(",", ":")), encoding="utf-8")
     os.replace(tmp, _SETTINGS_FILE)
     return merged
