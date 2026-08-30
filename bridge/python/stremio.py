@@ -911,6 +911,84 @@ def _public_stream_text(value: object) -> str:
     return text
 
 
+_RELEASE_BOUNDARY_WORDS = {
+    "season", "seasons", "series", "complete", "collection", "pack",
+    "proper", "repack", "internal", "extended", "uncut", "uncensored",
+    "bluray", "bdrip", "brrip", "webrip", "webdl", "web", "hdtv",
+    "dvdrip", "remux", "hdrip", "uhd", "amzn", "nf", "dsnp", "atvp",
+    "xvid", "x264", "x265", "h264", "h265", "hevc", "avc", "av1",
+    "ita", "eng", "rus", "multi", "dual", "dubbed", "subbed",
+}
+
+
+def _identity_tokens(value: object) -> list[str]:
+    return re.findall(r"[a-z0-9]+", str(value or "").casefold())
+
+
+def _series_release_conflicts(stream: dict, meta: dict) -> bool:
+    """Detect a confidently different series hidden in a provider result.
+
+    Some torrent indexes search by the word "Dexter" even when asked for the
+    exact IMDb id and return New Blood, Original Sin and Resurrection beside
+    the 2006 show.  The title prefix before Sxx/quality/release metadata is the
+    useful boundary: extra words there identify a different show.  Missing or
+    opaque labels are retained because they provide no safe basis to reject.
+    """
+    if not isinstance(stream, dict) or not isinstance(meta, dict):
+        return False
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", str(stream.get("infoHash") or "")):
+        return False
+    title_tokens = _identity_tokens(meta.get("name") or meta.get("title"))
+    if not title_tokens:
+        return False
+    year_match = re.search(
+        r"\b((?:18|19|20)\d{2})\b",
+        str(meta.get("year") or meta.get("releaseInfo") or meta.get("released") or ""),
+    )
+    expected_year = year_match.group(1) if year_match else ""
+    text = str(stream.get("description") or stream.get("title") or "")
+    conflicts = 0
+    for line in text.splitlines() or [text]:
+        tokens = _identity_tokens(line)
+        width = len(title_tokens)
+        for index in range(0, len(tokens) - width + 1):
+            if tokens[index:index + width] != title_tokens:
+                continue
+            tail = tokens[index + width:]
+            if not tail:
+                return False
+            first = tail[0]
+            if re.fullmatch(r"(?:18|19|20)\d{2}", first):
+                if expected_year and first != expected_year:
+                    conflicts += 1
+                    continue
+                return False
+            if (
+                first in _RELEASE_BOUNDARY_WORDS
+                or first.isdigit()
+                or re.fullmatch(r"s\d{1,2}(?:e\d{1,3})?", first)
+                or re.fullmatch(r"e\d{1,3}", first)
+                or re.fullmatch(r"\d{1,2}x\d{1,3}", first)
+                or re.fullmatch(r"(?:2160|1440|1080|720|576|480|360)p", first)
+            ):
+                return False
+            # Words between the canonical title and Sxx/release metadata are
+            # part of a longer title, not a quality tag: e.g. Dexter New Blood.
+            conflicts += 1
+    return conflicts > 0
+
+
+def filter_streams_for_media(value: str, items: list[dict]) -> list[dict]:
+    """Remove provider results that name a different franchise title."""
+    media_type, media_id = _split_id(value)
+    if media_type != "series" or not isinstance(items, list):
+        return items if isinstance(items, list) else []
+    meta = _recall_meta(media_type, media_id)
+    if not isinstance(meta, dict):
+        return items
+    return [item for item in items if not _series_release_conflicts(item, meta)]
+
+
 def _media_hint(label: str) -> str:
     video = ""
     for pattern, name in (

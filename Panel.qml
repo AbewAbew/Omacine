@@ -89,9 +89,17 @@ Panel {
     property int curEp: 0                 // 0 = movie
     property var streams: []
     property int selStream: -1
+    // Per-episode history may identify one exact torrent. Keep its marker
+    // separate from the current choice so a newly clicked row does not pretend
+    // to be cached before it has actually been played.
+    property int rememberedStreamIndex: -1
+    property bool streamSelectionTouched: false
     property var subs: []
     property bool captionsBusy: false
     property int captionsGen: 0
+    // Manual subtitle downloads are asynchronous. A newer selection owns the
+    // channel, so a late reply can never change captions in the wrong session.
+    property int subtitleSelectionGen: 0
     property string selectedSubtitle: "auto"
     property var audioOptions: []
     property int selectedAudio: -1
@@ -209,6 +217,11 @@ Panel {
     property string librarySort: "recent"
     property string currentCover: ""
     property string detailsReturnView: "home"
+    // The id that opened the fully rendered details page. currentId may later
+    // switch to an audio-specific alias, so it cannot identify a same-page
+    // return on its own.
+    property string loadedDetailRequestId: ""
+    property string loadedDetailProvider: ""
 
 
     readonly property bool isSeries: root.details ? (root.details.subjectType === 2 || root.seasons.length > 0) : false
@@ -1193,6 +1206,11 @@ Panel {
             if (Number(root.seasons[i].se) === Number(root.curSeason)) { seasonExists = true; break; }
         }
         if (root.seasons.length && !seasonExists) root.curSeason = Number(root.seasons[0].se) || 1;
+        // Dropdown takes ownership of its value after the user makes a choice,
+        // which replaces the declarative binding above it.  Resync the visible
+        // control when a different show's seasons arrive so it cannot retain
+        // the previous show's selection.
+        seasonSelector.value = String(root.curSeason);
         root.maxEp = root.episodeCount(root.curSeason);
         root.curEp = root.isSeries ? Math.min(Math.max(wantedEpisode || 1, 1), root.maxEp) : 0;
         root.streams = [];
@@ -1208,7 +1226,7 @@ Panel {
         if (cover) root.setCachedImage(root.safeUrl(cover), function(v) { detailPoster.source = v; });
     }
 
-    function openItem(it) {
+    function openItem(it, forceReload) {
         if (!it) return;
         // ListModel.get() hands back a live reference into the model. Opening a
         // card from the "More Like This" rail clears that very model further
@@ -1226,6 +1244,33 @@ Panel {
         // Opening a related title from the details page must not make "details"
         // the place Back returns to — keep the surface we originally came from.
         if (root.view !== "details") root.detailsReturnView = root.view;
+        // Back only hides the details Item; all of its local artwork paths,
+        // enriched metadata, episode cards and stream results are still valid.
+        // Re-entering the same title used to throw that state away and rebuild
+        // it from the disk caches, causing the visible placeholder reload even
+        // though no network request was necessary.
+        if (forceReload !== true && root.details
+                && root.loadedDetailRequestId === picked.id
+                && root.loadedDetailProvider === picked.provider) {
+            root.view = "details";
+            root.themeEditOpen = false;
+            root.themeEditText = "";
+            root.themeEditNote = "";
+            root.startThemeFor(root.loadedDetailRequestId);
+            if (root.streamsBusy)
+                root.statusText = root.isSeries
+                                ? "Loading streams for S" + root.curSeason + "E" + (root.curEp || 1) + " …"
+                                : "Loading streams …";
+            else if (root.streams.length > 0)
+                root.statusText = root.isSeries
+                                ? root.streams.length + " streams for S" + root.curSeason + "E" + (root.curEp || 1) + " — pick one and press Play"
+                                : root.streams.length + " streams — pick one and press Play";
+            else
+                root.statusText = root.isSeries ? "Pick a season and episode" : "Pick a stream and press Play";
+            return;
+        }
+        root.loadedDetailRequestId = picked.id;
+        root.loadedDetailProvider = picked.provider;
         root.currentId = picked.id;
         root.currentTitle = picked.title;
         root.currentCover = picked.cover;
@@ -1352,6 +1397,8 @@ Panel {
             var items = (resp && resp.ok && resp.items) ? resp.items : [];
             root.streams = root.sanitizeStreams(items);
             root.selStream = -1;
+            root.rememberedStreamIndex = -1;
+            root.streamSelectionTouched = false;
             root.streamPickerOpen = false;
             if (root.streams.length === 0) {
                 if (root.currentProvider === "stremio")
@@ -1367,16 +1414,69 @@ Panel {
             } else {
                 if (root.isSeries) root.statusText = root.streams.length + " streams for S" + se + "E" + (ep || 1) + " — pick one and press Play";
                 else root.statusText = root.streams.length + " streams — pick one and press Play";
-                root.selectPreferredStream();
+                // The bridge returns this episode's saved fingerprint beside
+                // the list, so shell startup ordering cannot hide it. The
+                // watchEntries lookup remains a compatibility fallback.
+                var remembered = resp && resp.rememberedStream ? resp.rememberedStream : null;
+                if (!root.restoreRememberedStream(se, ep, remembered)) root.selectPreferredStream();
             }
         };
         // use dedicated proc for instant E1 load without blocking on details queue
         root.requestStreams(params, cb);
     }
 
-    function selectStream(i) {
+    function selectStream(i, userInitiated) {
         root.selStream = i;
+        if (userInitiated === true) root.streamSelectionTouched = true;
         if (i >= 0 && i < root.streams.length) root.loadCaptions(root.streams[i]);
+    }
+
+    function rememberedStreamFor(se, ep) {
+        var entry = root.watchEntryFor(root.currentProvider, root.currentId,
+                                       root.isSeries ? se : 0,
+                                       root.isSeries ? ep : 0);
+        return entry && entry.stream ? entry.stream : null;
+    }
+
+    function streamMatchesRemembered(stream, remembered) {
+        if (!stream || !remembered) return false;
+        var kind = String(remembered.streamKind || "");
+        if (String(stream.streamKind || "") !== kind) return false;
+        if (kind === "p2p") {
+            return String(stream.infoHash || "").toLowerCase() === String(remembered.infoHash || "").toLowerCase()
+                && Number(stream.fileIdx !== undefined ? stream.fileIdx : -1)
+                   === Number(remembered.fileIdx !== undefined ? remembered.fileIdx : -1);
+        }
+        return kind === "direct" && String(stream.resourceId || "") !== ""
+            && String(stream.resourceId || "") === String(remembered.resourceId || "");
+    }
+
+    function restoreRememberedStream(se, ep, supplied) {
+        var remembered = supplied || root.rememberedStreamFor(se, ep);
+        root.rememberedStreamIndex = -1;
+        if (!remembered) return false;
+        for (var i = 0; i < root.streams.length; i++) {
+            if (!root.streamMatchesRemembered(root.streams[i], remembered)) continue;
+            root.rememberedStreamIndex = i;
+            if (!root.streamSelectionTouched) root.selectStream(i, false);
+            return true;
+        }
+        return false;
+    }
+
+    function streamMemory(stream) {
+        if (!stream) return null;
+        return {
+            streamKind: String(stream.streamKind || ""),
+            infoHash: String(stream.infoHash || ""),
+            fileIdx: Number(stream.fileIdx !== undefined ? stream.fileIdx : -1),
+            resourceId: String(stream.resourceId || ""),
+            resolution: Number(stream.resolution || 0),
+            size: Number(stream.size || 0),
+            mediaLabel: String(stream.mediaLabel || ""),
+            sourceLabel: String(stream.sourceLabel || ""),
+            addonKey: String(stream.addonKey || "")
+        };
     }
 
     function streamMatchesPreferences(stream) {
@@ -1469,10 +1569,33 @@ Panel {
             if (!allowed) return;
         }
         root.selectedSubtitle = next;
+        root.subtitleSelectionGen++;
+        var generation = root.subtitleSelectionGen;
         if (!root.playing || root.playbackId !== root.currentId) return;
         if (next === "off") root.sendMpvCommands([["set", "sid", "no"]], "captions");
         else if (next === "auto") root.sendMpvCommands([["set", "sid", "auto"]], "captions");
-        else root.sendMpvCommands([["sub-add", next, "select"]], "captions");
+        else {
+            // The automatic attach path has normally downloaded and added this
+            // track already. Passing its remote URL to mpv again made mpv fetch
+            // and add a duplicate, which can look like the cached video reloads.
+            // Resolve the same local filename and use mpv's `cached` mode: it
+            // selects an existing track, or loads it once if it is not attached.
+            var session = root.mpvSocketPath;
+            root.statusText = "Preparing selected caption…";
+            request("subtitle_fetch", { urls: [next] }, function(resp) {
+                if (generation !== root.subtitleSelectionGen
+                        || session !== root.mpvSocketPath
+                        || !root.playing || root.selectedSubtitle !== next) return;
+                var paths = (resp && resp.ok && resp.paths) ? resp.paths : {};
+                var cached = String(paths[next] || "");
+                if (!cached) {
+                    root.statusText = "Could not load the selected caption";
+                    return;
+                }
+                if (!root.sendMpvCommands([["sub-add", cached, "cached"]], "captions"))
+                    root.statusText = "Player is busy — select the caption again";
+            });
+        }
     }
 
     Process {
@@ -2210,12 +2333,16 @@ Panel {
         root.playbackDuration = 0;
         root.lastWatchSaveMs = 0;
         root.activeStream = stream;
+        // The visible marker can move immediately; durable history is written
+        // with the first progress sample and again when mpv closes.
+        root.rememberedStreamIndex = root.selStream;
         root.subs = root.normalizeSubtitles(stream.subtitles || []);
         root.selectedSubtitle = root.subs.length ? "auto" : "off";
         root.resetNextEpisode();
     }
 
     function clearPlaybackSession() {
+        root.subtitleSelectionGen++;
         root.resetPlaybackMetrics();
         root.warmTailState = "unknown";
         root.nextWarmTailState = "unknown";
@@ -2769,7 +2896,8 @@ Panel {
             episode: root.playbackEpisode,
             position: root.playbackPosition,
             duration: root.playbackDuration,
-            completed: completed === true
+            completed: completed === true,
+            stream: root.streamMemory(root.activeStream)
         };
         if (watchProgressProc.running) {
             watchProgressProc.pendingPayloads.push(payload);
@@ -2790,12 +2918,19 @@ Panel {
         for (var i = 0; i < root.watchEntries.length; i++)
             if (root.watchEntries[i].key !== entry.key) updated.push(root.watchEntries[i]);
         root.watchEntries = updated;
+        if (root.view === "details" && root.streams.length > 0)
+            root.restoreRememberedStream(root.isSeries ? root.curSeason : 0,
+                                         root.isSeries ? root.curEp : 0);
         continueModel.clear();
         for (var j = 0; j < updated.length && continueModel.count < 20; j++) {
             var candidate = updated[j];
             if (candidate.completed !== true && Number(candidate.position || 0) >= 15)
                 root.appendHomeItem(continueModel, candidate, candidate.provider || "stremio");
         }
+        // Rebuilding the model resets coverPath to the remote cover URL. Resolve
+        // it back to the existing on-disk poster so leaving and returning Home
+        // does not depend on Qt fetching every Continue Watching image again.
+        root.cachePosters(continueModel);
     }
 
     function cancelNextEpisode() {
@@ -3379,6 +3514,10 @@ Panel {
         });
     }
 
+    // Which month the live rebuild has answered for, so a snapshot that
+    // arrives late cannot overwrite fresher data.
+    property string calendarLiveMonth: ""
+
     function openCalendar(force) {
         root.addonManagerOpen = false;
         root.view = "calendar";
@@ -3392,27 +3531,49 @@ Panel {
         root.loadCalendarMonth();
     }
 
+    function applyCalendarPayload(resp, wanted) {
+        if (wanted !== root.calendarMonth) return false;
+        if (!resp || !resp.ok) return false;
+        root.calendarToday = String(resp.today || "");
+        root.calendarUpcoming = Array.isArray(resp.upcoming) ? resp.upcoming : [];
+        root.calendarCells = root.buildCalendarCells(resp.days || [], resp.first, resp.last);
+        root.calendarLoaded = true;
+        var total = 0;
+        for (var i = 0; i < (resp.days || []).length; i++) total += resp.days[i].entries.length;
+        root.statusText = total + " episodes from your shows in " + root.calendarMonthLabel();
+        return true;
+    }
+
     function loadCalendarMonth() {
         if (root.calendarLoading) return;
         root.calendarLoading = true;
+        var wanted = root.calendarMonth;
+        root.calendarLiveMonth = "";
+        // Disk first, the way the home feed already works. The month last
+        // built paints in about a millisecond, so the spinner is left for a
+        // calendar that genuinely has nothing to show. Rebuilding is cheap
+        // while every followed show's metadata is warm, but once that expires
+        // it goes to the network for each of them, and an empty grid behind a
+        // spinner is exactly the wrong thing to show while that happens.
+        request("calendar_snapshot", { month: wanted }, function(snap) {
+            if (root.calendarLiveMonth === wanted) return;   // live answer already won
+            if (!snap || snap.cached !== true) return;
+            if (root.applyCalendarPayload(snap, wanted)) root.busy = false;
+        });
         root.busy = root.calendarCells.length === 0;
         root.busyLabel = "Building the schedule\u2026";
-        var wanted = root.calendarMonth;
         request("calendar_month", { month: wanted }, function(resp) {
             root.calendarLoading = false;
             root.busy = false;
             if (wanted !== root.calendarMonth) return;
             if (!resp || !resp.ok) {
+                // A snapshot may already be on screen; keep it rather than
+                // replacing a usable month with an error.
                 root.statusText = root.friendlyText((resp && resp.error) || "Could not load the calendar");
                 return;
             }
-            root.calendarToday = String(resp.today || "");
-            root.calendarUpcoming = Array.isArray(resp.upcoming) ? resp.upcoming : [];
-            root.calendarCells = root.buildCalendarCells(resp.days || [], resp.first, resp.last);
-            root.calendarLoaded = true;
-            var total = 0;
-            for (var i = 0; i < (resp.days || []).length; i++) total += resp.days[i].entries.length;
-            root.statusText = total + " episodes from your shows in " + root.calendarMonthLabel();
+            root.calendarLiveMonth = wanted;
+            root.applyCalendarPayload(resp, wanted);
         });
     }
 
@@ -3556,10 +3717,14 @@ Panel {
         request("watch_list", {}, function(resp) {
             if (!resp || !resp.ok) return;
             root.watchEntries = Array.isArray(resp.entries) ? resp.entries : [];
+            if (root.view === "details" && root.streams.length > 0)
+                root.restoreRememberedStream(root.isSeries ? root.curSeason : 0,
+                                             root.isSeries ? root.curEp : 0);
             continueModel.clear();
             var continuing = Array.isArray(resp.continueWatching) ? resp.continueWatching : [];
             for (var i = 0; i < continuing.length; i++)
                 root.appendHomeItem(continueModel, continuing[i], continuing[i].provider || "stremio");
+            root.cachePosters(continueModel);
         });
     }
 
@@ -3802,7 +3967,7 @@ Panel {
                 provider: root.currentProvider,
                 resumeSeason: root.curSeason,
                 resumeEpisode: 1
-            });
+            }, true);
         } else root.loadHome(true);
     }
 
@@ -6914,6 +7079,7 @@ Panel {
                                 visible: root.isSeries
                                 spacing: 8
                                 Dropdown {
+                                    id: seasonSelector
                                     width: 150
                                     showLabel: false
                                     value: String(root.curSeason)
@@ -7090,6 +7256,7 @@ Panel {
                                 visible: root.streams.length > 0
                                 streams: root.streams
                                 selectedIndex: root.selStream
+                                rememberedIndex: root.rememberedStreamIndex
                                 expanded: root.streamPickerOpen
                                 loading: root.streamsBusy
                                 qualityLimit: root.streamQualityLimit
@@ -7098,7 +7265,7 @@ Panel {
                                 uiScale: panel.uiScale
                                 textScale: root.textScale
                                 onSelected: function(originalIndex) {
-                                    root.selectStream(originalIndex);
+                                    root.selectStream(originalIndex, true);
                                     root.streamPickerOpen = false;
                                 }
                                 onExpandedRequested: function(value) { root.streamPickerOpen = value; }

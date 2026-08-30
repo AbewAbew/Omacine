@@ -55,6 +55,12 @@ _LIBRARY_FILE = _STATE_DIR / "library.json"
 _HOME_SNAPSHOT_FILE = _STATE_DIR / "home-snapshot.json"
 CONTINUE_WATCHING_LIMIT = 12
 HOME_SNAPSHOT_MAX_AGE = 7 * 24 * 60 * 60
+# One file per month, because paging back and forth should not re-derive a
+# month already built. A month is kept well past its own end: an old month
+# cannot gain episodes, and painting a stale one instantly beats an empty
+# grid while the live answer is on its way.
+_CALENDAR_SNAPSHOT_DIR = _STATE_DIR / "calendar-months"
+CALENDAR_SNAPSHOT_MAX_AGE = 30 * 24 * 60 * 60
 
 
 def _scratch_path(path: Path) -> Path:
@@ -110,6 +116,58 @@ def _watch_number(value, *, integer: bool = False):
     return int(number) if integer else number
 
 
+def _watch_stream(value) -> dict:
+    """Keep only the stable, non-secret identity of a played stream.
+
+    Torrent tracker URLs and direct-stream headers can contain credentials and
+    expire, so watch history must never persist the full playback object.  A
+    torrent's info hash plus file index identifies the exact cached file; a
+    direct stream can only be recalled while its stable resource id matches.
+    The remaining fields are display hints, not matching authority.
+    """
+    if not isinstance(value, dict):
+        return {}
+    kind = str(value.get("streamKind") or "").strip().lower()
+    if kind not in ("p2p", "direct"):
+        return {}
+    info_hash = str(value.get("infoHash") or "").strip().lower()
+    resource_id = str(value.get("resourceId") or "").strip()
+    try:
+        file_idx = max(-1, min(1_000_000, int(value.get("fileIdx", -1))))
+    except (TypeError, ValueError, OverflowError):
+        file_idx = -1
+    if kind == "p2p":
+        if not re.fullmatch(r"[0-9a-f]{40}", info_hash):
+            return {}
+    elif not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", resource_id):
+        return {}
+
+    remembered = {
+        "streamKind": kind,
+        "resolution": min(16384, _watch_number(value.get("resolution"), integer=True)),
+        "size": min(10**15, _watch_number(value.get("size"), integer=True)),
+        "mediaLabel": str(value.get("mediaLabel") or "")[:80],
+        "sourceLabel": str(value.get("sourceLabel") or "")[:120],
+        "addonKey": str(value.get("addonKey") or "")[:128],
+    }
+    if kind == "p2p":
+        remembered.update({"infoHash": info_hash, "fileIdx": file_idx})
+    else:
+        remembered["resourceId"] = resource_id
+    return remembered
+
+
+def _remembered_stream_for(media_id: str, season: int, episode: int) -> dict:
+    """Return the stream fingerprint for one exact watch-history record."""
+    key = hashlib.sha256(
+        f"stremio|{media_id}|{season}|{episode}".encode("utf-8")
+    ).hexdigest()[:24]
+    for entry in _watch_entries():
+        if entry.get("key") == key:
+            return _watch_stream(entry.get("stream"))
+    return {}
+
+
 def save_watch_progress(req: dict) -> dict:
     provider = str_arg(req, "provider").strip().lower()
     if provider != "stremio":
@@ -124,8 +182,11 @@ def save_watch_progress(req: dict) -> dict:
     duration = _watch_number(req.get("duration"))
     ratio = min(1.0, position / duration) if duration > 0 else 0.0
     completed = req.get("completed") is True or ratio >= 0.92
+    key = hashlib.sha256(f"{provider}|{media_id}|{season}|{episode}".encode("utf-8")).hexdigest()[:24]
+    entries = _watch_entries()
+    previous = next((item for item in entries if item.get("key") == key), None)
     entry = {
-        "key": hashlib.sha256(f"{provider}|{media_id}|{season}|{episode}".encode("utf-8")).hexdigest()[:24],
+        "key": key,
         "provider": provider,
         "id": media_id,
         "title": title,
@@ -139,7 +200,12 @@ def save_watch_progress(req: dict) -> dict:
         "completed": completed,
         "updated": int(time.time()),
     }
-    entries = [existing for existing in _watch_entries() if existing.get("key") != entry["key"]]
+    remembered_stream = _watch_stream(req.get("stream"))
+    if not remembered_stream and isinstance(previous, dict):
+        remembered_stream = _watch_stream(previous.get("stream"))
+    if remembered_stream:
+        entry["stream"] = remembered_stream
+    entries = [existing for existing in entries if existing.get("key") != entry["key"]]
     entries.insert(0, entry)
     entries.sort(key=lambda value: int(value.get("updated") or 0), reverse=True)
     _write_watch_entries(entries)
@@ -183,6 +249,39 @@ def _save_home_snapshot(payload: dict) -> None:
         _write_private_json(_HOME_SNAPSHOT_FILE, {"saved": int(time.time()), "payload": payload})
     except OSError:
         pass
+
+
+def _calendar_snapshot_path(month: str) -> Path:
+    return _CALENDAR_SNAPSHOT_DIR / f"{month}.json"
+
+
+def _save_calendar_snapshot(month: str, payload: dict) -> None:
+    """Keep the last built month so reopening the calendar paints at once."""
+    if not re.fullmatch(r"\d{4}-\d{2}", month or ""):
+        return
+    try:
+        _CALENDAR_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _write_private_json(_calendar_snapshot_path(month),
+                            {"saved": int(time.time()), "payload": payload})
+    except OSError:
+        pass
+
+
+def _load_calendar_snapshot(month: str) -> dict:
+    if not re.fullmatch(r"\d{4}-\d{2}", month or ""):
+        return {"cached": False}
+    try:
+        value = json.loads(_calendar_snapshot_path(month).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {"cached": False}
+    payload = value.get("payload")
+    saved = int(value.get("saved") or 0)
+    if not isinstance(payload, dict) or time.time() - saved > CALENDAR_SNAPSHOT_MAX_AGE:
+        return {"cached": False}
+    result = dict(payload)
+    result["cached"] = True
+    result["savedAt"] = saved
+    return result
 
 
 def _load_home_snapshot() -> dict:
@@ -585,7 +684,7 @@ def _validated_mpv_commands(value) -> list[list]:
             # --start used to resume the current one.
             if set(options) - {"force-media-title", "http-header-fields", "start"} or not all(isinstance(value, str) for value in options.values()):
                 raise ValueError("unsupported playlist option")
-        elif name == "sub-add" and (len(command) not in (2, 3) or (len(command) == 3 and command[2] not in ("auto", "select"))):
+        elif name == "sub-add" and (len(command) not in (2, 3) or (len(command) == 3 and command[2] not in ("auto", "select", "cached"))):
             raise ValueError("invalid subtitle command")
         elif name == "set" and (len(command) != 3 or command[1] != "sid" or command[2] not in ("no", "auto")):
             raise ValueError("invalid player property command")
@@ -787,7 +886,16 @@ def run(cmd: str, req: dict):
         if not idv:
             raise ValueError("missing id")
         items = stremio_streams_cached(idv, season, episode)
-        return {"items": items, "value": {"list": items}, "provider": "stremio", "resolvedId": idv}
+        return {
+            "items": items,
+            "value": {"list": items},
+            "provider": "stremio",
+            "resolvedId": idv,
+            # Keep the stream list and its per-episode selection in one reply.
+            # QML used to join this against a separate watch_list request,
+            # which made restoration depend on startup callback ordering.
+            "rememberedStream": _remembered_stream_for(idv, season, episode) or None,
+        }
 
     elif cmd == "prepare_next":
         idv = str_arg(req, "id")
@@ -883,11 +991,21 @@ def run(cmd: str, req: dict):
             data = net.fetch_image(url, timeout=25.0, limit=8 * 1024 * 1024)
             if not data:
                 return url, ""
+            tmp = None
             try:
-                tmp = path.with_suffix(".new")
+                # Manual selection can ask for the same subtitle while the
+                # automatic attach is still fetching it. Each daemon worker
+                # needs its own temporary name or one rename steals the other's
+                # file and leaves the second request failing with ENOENT.
+                tmp = _scratch_path(path)
                 tmp.write_bytes(data)
                 os.replace(tmp, path)
             except OSError:
+                try:
+                    if tmp is not None:
+                        tmp.unlink()
+                except OSError:
+                    pass
                 return url, ""
             return url, str(path)
 
@@ -1160,10 +1278,23 @@ def run(cmd: str, req: dict):
             upcoming.setdefault(row["date"], []).append(row)
         rail = [{"date": d, "entries": sorted(upcoming[d], key=lambda r: (r["title"].lower(), r["episode"]))}
                 for d in sorted(upcoming)][:40]
-        return {"month": month, "first": first.isoformat(), "last": last.isoformat(),
-                "today": today.isoformat(),
-                "days": [{"date": d, "entries": days[d]} for d in sorted(days)],
-                "upcoming": rail}
+        payload = {"month": month, "first": first.isoformat(), "last": last.isoformat(),
+                   "today": today.isoformat(),
+                   "days": [{"date": d, "entries": days[d]} for d in sorted(days)],
+                   "upcoming": rail}
+        _save_calendar_snapshot(month, payload)
+        return payload
+
+    elif cmd == "calendar_snapshot":
+        # Pure disk read, the same contract as home_snapshot: lets the grid
+        # paint the last known month immediately while calendar_month rebuilds
+        # it behind. Building is not slow when the per-show metadata is warm,
+        # but it goes to the network for every followed show once that expires,
+        # and an empty grid with a spinner is the worst thing to show then.
+        month = str(req.get("month") or "")
+        if not re.fullmatch(r"\d{4}-\d{2}", month):
+            month = datetime.date.today().strftime("%Y-%m")
+        return _load_calendar_snapshot(month)
 
     elif cmd == "tmdb_calendar":
         # The library is passed in rather than read inside tmdb.py: that module
@@ -1223,15 +1354,21 @@ def stremio_streams_cached(media_id: str, season: int, episode: int) -> list:
     key = (media_id, int(season), int(episode))
     hit = _STREAM_MEMO.get(key)
     if hit is not None and time.time() - hit[0] < 1800:
-        return _retarget_local_streams(hit[1])
+        return stremio.filter_streams_for_media(
+            media_id, _retarget_local_streams(hit[1])
+        )
 
     stored = get_provider_stream_cache("stremio", media_id, season, episode)
     if isinstance(stored, dict) and isinstance(stored.get("list"), list):
-        cached = _retarget_local_streams(stored["list"])
+        cached = stremio.filter_streams_for_media(
+            media_id, _retarget_local_streams(stored["list"])
+        )
         _STREAM_MEMO[key] = (time.time(), cached)
         return cached
 
-    items = stremio.streams(media_id, season, episode)
+    items = stremio.filter_streams_for_media(
+        media_id, stremio.streams(media_id, season, episode)
+    )
     if items:
         _STREAM_MEMO[key] = (time.time(), items)
         try:

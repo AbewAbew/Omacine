@@ -63,19 +63,23 @@ class MpvBridgeTests(unittest.TestCase):
             ["loadfile", "https://media.example.test/e2.mp4", "insert-next", -1, {"force-media-title": "Episode 2"}],
             ["sub-add", "https://subs.example.test/e2.srt", "auto"],
             ["sub-add", "https://subs.example.test/english.srt", "select"],
+            ["sub-add", "https://subs.example.test/cached.srt", "cached"],
             ["set", "sid", "no"],
             ["set", "sid", "auto"],
             ["playlist-remove", 1],
             ["playlist-next", "force"],
             ["playlist-clear"],
         ])
-        self.assertEqual(len(commands), 8)
+        self.assertEqual(len(commands), 9)
         with self.assertRaises(ValueError):
             bridge_main._validated_mpv_commands([["run", "sh", "-c", "true"]])
         with self.assertRaises(ValueError):
             bridge_main._validated_mpv_commands([["loadfile", "file:///etc/passwd"]])
         with self.assertRaises(ValueError):
             bridge_main._validated_mpv_commands([["set", "volume", 100]])
+        with self.assertRaises(ValueError):
+            bridge_main._validated_mpv_commands(
+                [["sub-add", "https://subs.example.test/a.srt", "reload"]])
 
     def test_multiple_cached_subtitles_keep_command_allowlist_intact(self):
         with tempfile.TemporaryDirectory() as cache_dir, patch.object(
@@ -134,6 +138,82 @@ class MpvBridgeTests(unittest.TestCase):
             })
             self.assertTrue(completed["completed"])
             self.assertEqual(bridge_main.watch_state()["continueWatching"], [])
+
+    def test_watch_progress_remembers_exact_torrent_without_secrets(self):
+        with tempfile.TemporaryDirectory() as state_dir, patch.object(
+            bridge_main, "_STATE_DIR", Path(state_dir)
+        ), patch.object(bridge_main, "_WATCH_FILE", Path(state_dir) / "watch-progress.json"):
+            info_hash = "0123456789abcdef0123456789abcdef01234567"
+            first = bridge_main.save_watch_progress({
+                "provider": "stremio", "id": "series|tt1", "title": "Demo Show",
+                "stype": 2, "season": 3, "episode": 7, "position": 120,
+                "duration": 2400,
+                "stream": {
+                    "streamKind": "p2p", "infoHash": info_hash.upper(), "fileIdx": 4,
+                    "resourceId": info_hash,
+                    "resourceLink": "http://127.0.0.1:11480/secret?tr=private-token",
+                    "headers": [["Authorization", "Bearer secret"]],
+                    "resolution": 1080, "size": 734003200, "mediaLabel": "HEVC",
+                    "sourceLabel": "IO Streams", "addonKey": "addon-one",
+                },
+            })
+
+            self.assertEqual(first["stream"]["infoHash"], info_hash)
+            self.assertEqual(first["stream"]["fileIdx"], 4)
+            self.assertEqual(first["stream"]["resolution"], 1080)
+            self.assertNotIn("resourceLink", first["stream"])
+            self.assertNotIn("headers", first["stream"])
+
+            # A later progress-only write must not forget which file supplied
+            # the episode (important during upgrades and queued save drains).
+            later = bridge_main.save_watch_progress({
+                "provider": "stremio", "id": "series|tt1", "title": "Demo Show",
+                "stype": 2, "season": 3, "episode": 7, "position": 180,
+                "duration": 2400,
+            })
+            self.assertEqual(later["stream"]["infoHash"], info_hash)
+            self.assertEqual(later["stream"]["fileIdx"], 4)
+
+    def test_watch_progress_rejects_invalid_stream_identity(self):
+        with tempfile.TemporaryDirectory() as state_dir, patch.object(
+            bridge_main, "_STATE_DIR", Path(state_dir)
+        ), patch.object(bridge_main, "_WATCH_FILE", Path(state_dir) / "watch-progress.json"):
+            entry = bridge_main.save_watch_progress({
+                "provider": "stremio", "id": "movie|tt2", "title": "Demo Movie",
+                "position": 60, "duration": 600,
+                "stream": {"streamKind": "p2p", "infoHash": "not-a-hash", "fileIdx": 0},
+            })
+            self.assertNotIn("stream", entry)
+
+    def test_resources_returns_episode_stream_memory_after_restart(self):
+        with tempfile.TemporaryDirectory() as state_dir, patch.object(
+            bridge_main, "_STATE_DIR", Path(state_dir)
+        ), patch.object(bridge_main, "_WATCH_FILE", Path(state_dir) / "watch-progress.json"):
+            info_hash = "abcdef0123456789abcdef0123456789abcdef01"
+            bridge_main.save_watch_progress({
+                "provider": "stremio", "id": "series|tmdb:456", "title": "Demo Show",
+                "stype": 2, "season": 37, "episode": 1, "position": 120,
+                "duration": 1200,
+                "stream": {"streamKind": "p2p", "infoHash": info_hash, "fileIdx": 0},
+            })
+            candidate = {
+                "streamKind": "p2p", "infoHash": info_hash, "fileIdx": 0,
+                "resourceLink": f"http://127.0.0.1:11480/{info_hash}/0",
+            }
+            with patch.object(bridge_main, "stremio_streams_cached", return_value=[candidate]):
+                result = bridge_main.run("resources", {
+                    "id": "series|tmdb:456", "season": 37, "episode": 1,
+                })
+
+            self.assertEqual(result["items"], [candidate])
+            self.assertEqual(result["rememberedStream"]["infoHash"], info_hash)
+            self.assertEqual(result["rememberedStream"]["fileIdx"], 0)
+
+            with patch.object(bridge_main, "stremio_streams_cached", return_value=[]):
+                other = bridge_main.run("resources", {
+                    "id": "series|tmdb:456", "season": 37, "episode": 2,
+                })
+            self.assertIsNone(other["rememberedStream"])
 
     def test_continue_watching_collapses_series_and_has_a_small_limit(self):
         with tempfile.TemporaryDirectory() as state_dir, patch.object(

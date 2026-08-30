@@ -9,6 +9,7 @@ Item {
 
     property var streams: []
     property int selectedIndex: -1
+    property int rememberedIndex: -1
     property bool expanded: false
     property bool loading: false
     property int qualityLimit: 1080
@@ -36,6 +37,19 @@ Item {
         if (value <= 0) return "";
         if (value >= 1073741824) return (value / 1073741824).toFixed(value >= 10737418240 ? 0 : 1) + " GB";
         return Math.round(value / 1048576) + " MB";
+    }
+    function releaseName(stream) {
+        var lines = String(stream && stream.description || "").split("\n");
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].trim();
+            if (!line || line.indexOf("📅") === 0 || line.indexOf("👤") === 0) continue;
+            return line;
+        }
+        return "";
+    }
+    function streamTooltip(stream, fallback) {
+        var release = root.releaseName(stream);
+        return release ? release + "\n" + fallback : fallback;
     }
     function streamLabel(stream) {
         if (!stream) return root.loading ? "Loading available streams…" : "Choose a stream";
@@ -79,6 +93,9 @@ Item {
         return root.selectedIndex >= 0 && root.selectedIndex < root.streams.length
              ? root.streams[root.selectedIndex] : null;
     }
+    function rememberedSuffix(index) {
+        return index === root.rememberedIndex ? "  •  Last played" : "";
+    }
 
     // Content-sized, not parent-sized: expanding must grow the picker so the
     // details column scrolls, instead of squeezing the list into a fixed box.
@@ -93,7 +110,9 @@ Item {
             Layout.fillWidth: true
             Layout.alignment: Qt.AlignTop
             text: (root.expanded ? "▴  " : "▾  ") + root.streamLabel(root.currentStream())
-            tooltipText: root.expanded ? "Close stream choices" : "Compare quality, availability and size"
+                + root.rememberedSuffix(root.selectedIndex)
+            tooltipText: root.streamTooltip(root.currentStream(),
+                root.expanded ? "Close stream choices" : "Compare quality, availability and size")
             selected: true
             leftAlign: true
             enabled: !root.loading && root.streams.length > 0
@@ -171,7 +190,8 @@ Item {
             delegate: Button {
                 required property var modelData
                 width: choices.width
-                text: root.streamLabel(modelData.stream)
+                text: root.streamLabel(modelData.stream) + root.rememberedSuffix(modelData.originalIndex)
+                tooltipText: root.streamTooltip(modelData.stream, "Select this stream")
                 leftAlign: true
                 selected: modelData.originalIndex === root.selectedIndex
                 fontSize: root.fs(Style.font.caption)

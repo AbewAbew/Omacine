@@ -457,6 +457,36 @@ class ResolverTests(unittest.TestCase):
             self.assertIn(source, stremio._peer_sources({"sources": []}, raw_hash))
         self.assertIn(f"dht:{raw_hash}", stremio._peer_sources({"sources": []}, raw_hash))
 
+    def test_series_stream_filter_rejects_franchise_spinoffs(self):
+        hashes = [f"{number:040x}" for number in range(1, 8)]
+        items = [
+            {"infoHash": hashes[0], "description": "Dexter (2006) - S01E01 - Dexter (1080p BluRay).mkv"},
+            {"infoHash": hashes[1], "description": "Dexter.S01E01.Pilot.1080p.WEB-DL.mkv"},
+            {"infoHash": hashes[2], "description": "Dexter.New.Blood.S01E01.720p.WEBRip.mkv"},
+            {"infoHash": hashes[3], "description": "Dexter Resurrection (2025) - S01E01.mkv"},
+            {"infoHash": hashes[4], "description": "Dexter Original Sin 2024 Season 1 Complete"},
+            # No title evidence means the result is retained rather than
+            # guessing; direct addon links also remain trusted by exact id.
+            {"infoHash": hashes[5], "description": "📅 S01E01 👤 5 💾 800 MB"},
+            {"streamKind": "direct", "description": "Dexter New Blood", "resourceId": "direct-one"},
+        ]
+        meta = {"id": "tmdb:1405", "type": "series", "name": "Dexter", "year": "2006-2013"}
+        with patch.object(stremio, "_recall_meta", return_value=meta):
+            filtered = stremio.filter_streams_for_media("series|tmdb:1405", items)
+
+        self.assertEqual(filtered, [items[0], items[1], items[5], items[6]])
+
+    def test_series_stream_filter_accepts_canonical_multiword_title(self):
+        items = [
+            {"infoHash": "1" * 40, "description": "Star.Trek.S01E01.1080p.BluRay.mkv"},
+            {"infoHash": "2" * 40, "description": "Star Trek Picard S01E01 1080p WEB-DL.mkv"},
+        ]
+        meta = {"type": "series", "name": "Star Trek", "year": "1966-1969"}
+        with patch.object(stremio, "_recall_meta", return_value=meta):
+            filtered = stremio.filter_streams_for_media("series|tmdb:253", items)
+
+        self.assertEqual(filtered, [items[0]])
+
     def test_warm_stream_uses_head_then_priority_range(self):
         requests = []
 
