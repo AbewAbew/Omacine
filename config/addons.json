@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "metadataManifest": "",
-  "streamingServer": "http://127.0.0.1:11470",
+  "streamingServer": "http://127.0.0.1:11480",
   "cacheSizeBytes": 10737418240,
   "builtinFreeMedia": true,
   "builtinFreeResolver": true,
@@ -14,7 +14,7 @@
     },
     {
       "name": "Stremio Local Files",
-      "manifestUrl": "http://127.0.0.1:11470/local-addon/manifest.json",
+      "manifestUrl": "http://127.0.0.1:11480/local-addon/manifest.json",
       "enabled": true
     }
   ]

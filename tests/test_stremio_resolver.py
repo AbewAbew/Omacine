@@ -200,12 +200,12 @@ class ResolverTests(unittest.TestCase):
         }
         candidates = [
             {
-                "resourceLink": "http://127.0.0.1:11470/other/0", "streamKind": "p2p",
+                "resourceLink": "http://127.0.0.1:11480/other/0", "streamKind": "p2p",
                 "addonKey": "addon-one", "continuityGroup": "group-b", "resolution": 1080,
                 "mediaLabel": "HEVC", "peerCount": 500,
             },
             {
-                "resourceLink": "http://127.0.0.1:11470/exact/0", "streamKind": "p2p",
+                "resourceLink": "http://127.0.0.1:11480/exact/0", "streamKind": "p2p",
                 "addonKey": "addon-one", "continuityGroup": "group-a", "resolution": 720,
                 "mediaLabel": "AVC", "peerCount": 2,
             },
@@ -482,7 +482,7 @@ class ResolverTests(unittest.TestCase):
             return FakeResponse(request.get_method())
 
         with patch.object(stremio, "urlopen", side_effect=fake_open):
-            result = stremio.warm_stream("http://127.0.0.1:11470/example/0")
+            result = stremio.warm_stream("http://127.0.0.1:11480/example/0")
 
         self.assertTrue(result["ready"])
         self.assertEqual(result["bytes"], 1048577)
@@ -490,6 +490,43 @@ class ResolverTests(unittest.TestCase):
         self.assertEqual(requests[1][0].get_header("Range"), "bytes=0-1048576")
         self.assertEqual(requests[1][0].get_header("Enginefs-prio"), "255")
         self.assertEqual(result["priorityWindowBytes"], 10000000)
+
+    def test_release_stream_uses_the_engine_remove_route(self):
+        raw_hash = "0123456789abcdef0123456789abcdef01234567"
+        asked = []
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_open(request, timeout):
+            asked.append(request.full_url)
+            return FakeResponse()
+
+        with patch.object(stremio, "urlopen", side_effect=fake_open):
+            result = stremio.release_stream(f"http://127.0.0.1:11480/{raw_hash}/2")
+
+        self.assertTrue(result["released"])
+        # /:id/destroy belongs to the HLS converter and answers 200 while
+        # leaving the swarm running, so it must never be used here.
+        self.assertEqual(asked, [f"http://127.0.0.1:11480/{raw_hash}/remove"])
+
+    def test_release_stream_reports_failure_rather_than_raising(self):
+        raw_hash = "0123456789abcdef0123456789abcdef01234567"
+
+        with patch.object(stremio, "urlopen", side_effect=OSError("engine gone")):
+            result = stremio.release_stream(f"http://127.0.0.1:11480/{raw_hash}/2")
+
+        self.assertFalse(result["released"])
+
+    def test_release_stream_refuses_non_local_targets(self):
+        with self.assertRaises(ValueError):
+            stremio.release_stream("http://example.com/0123456789abcdef0123456789abcdef01234567/2")
 
     def test_stream_status_returns_safe_connection_telemetry(self):
         raw_hash = "0123456789abcdef0123456789abcdef01234567"
@@ -523,11 +560,11 @@ class ResolverTests(unittest.TestCase):
             requested.append((request.full_url, timeout))
             return FakeResponse()
 
-        url = f"http://127.0.0.1:11470/{raw_hash}/0?tr=example"
+        url = f"http://127.0.0.1:11480/{raw_hash}/0?tr=example"
         with patch.object(stremio, "urlopen", side_effect=fake_open):
             status = stremio.stream_status(url)
 
-        self.assertEqual(requested[0][0], f"http://127.0.0.1:11470/{raw_hash}/0/stats.json")
+        self.assertEqual(requested[0][0], f"http://127.0.0.1:11480/{raw_hash}/0/stats.json")
         self.assertEqual(status, {
             "available": True,
             "sources": 7,

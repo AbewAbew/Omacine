@@ -72,7 +72,12 @@ Panel {
     property string view: "home"          // home | discover | grid | details | library | calendar | player
     // One place to silence the theme, so every way out of a details page is
     // covered without threading a call through each navigation function.
-    onViewChanged: if (root.view !== "details") root.stopTheme();
+    onViewChanged: {
+        if (root.view !== "details") root.stopTheme();
+        // Leaving the page without playing: hand back any engine a prefetch
+        // started, rather than leaving a swarm alive behind a closed panel.
+        if (root.view !== "details" && !root.playing) root.clearPrefetch(true);
+    }
     property var details: null
     property string currentId: ""
     property string currentTitle: ""
@@ -105,6 +110,34 @@ Panel {
     property string streamHealthText: ""
     property string streamHealthState: "idle"
     property int streamHealthPolls: 0
+    // Playback metrics. Timestamps are epoch ms, 0 meaning "not reached yet".
+    // These exist to answer one question before any further tuning: is the
+    // constraint time-to-first-frame, or is it rebuffering once running?
+    property double metricPlayClickMs: 0
+    property double metricEngineReadyMs: 0
+    property double metricMpvLaunchMs: 0
+    property double metricFirstFrameMs: 0
+    property int metricRebuffers: 0
+    // Bounds the fast startup polling. mpv stays open on a stream that never
+    // decodes (--idle=yes --keep-open=yes), so without a ceiling a dead
+    // torrent would spawn a bridge process every 300ms forever.
+    property int metricStartupPolls: 0
+    property double metricRebufferMs: 0
+    property double metricStarvedSinceMs: 0
+    // Seconds of contiguous media ahead of the playhead, straight from mpv.
+    property real bufferAheadSecs: 0
+    property real cacheSpeedBps: 0
+    // Prefetch state. prefetchLink is the stream whose engine we have already
+    // asked the server to start; prefetchState says how far that has got, so
+    // Play can skip the warm, adopt one in flight, or fall back to warming.
+    property string prefetchLink: ""
+    // idle | warming | ready | cold. "cold" means the warm completed but the
+    // swarm produced no bytes in time, which is exactly when Play still needs
+    // the full warm-and-launch rather than the shortcut.
+    property string prefetchState: "idle"
+    property int prefetchGen: 0
+    property string pendingWarmLink: ""
+    property var releaseQueue: []
     property string mpvSocketPath: ""
     property string playbackProvider: ""
     property string playbackId: ""
@@ -229,6 +262,7 @@ Panel {
         themeVideoDelay: 1.8,
         uiFontFamily: "Adwaita Sans",
         reviewOpacity: 0.94,
+        prefetchStreams: true,
         cachePostersMB: 200,
         cacheThemesMB: 800,
         cacheTorrentGB: 11,
@@ -1585,10 +1619,29 @@ Panel {
         var sourceLabel = root.currentProvider === "stremio" ? root.friendlyText(s.sourceLabel || "Addon") : "";
         var badge = root.friendlyText(s.streamBadge || (s.streamKind === "p2p" ? "Cached Stream" : "Fast Mirror"));
         var subLabel = sourceLabel ? (" • " + sourceLabel + " • " + badge) : "";
-        if (root.currentProvider === "stremio" && s.streamKind === "p2p")
-            root._warmAndLaunch(args, link, subLabel);
-        else
+        if (root.currentProvider === "stremio" && s.streamKind === "p2p") {
+            if (link === root.prefetchLink && root.prefetchState === "warming") {
+                root._adoptWarmAndLaunch(args, link, subLabel);
+            } else if (link === root.prefetchLink && root.prefetchState === "ready") {
+                // Already warmed while the picker was open. The engine exists
+                // and its peers are connected, so warming a second time would
+                // only put the 1.9s ceiling back in front of mpv.
+                root.resetPlaybackMetrics();
+                root.metricPlayClickMs = Date.now();
+                root.metricEngineReadyMs = root.metricPlayClickMs;
+                root.streamHealthUrl = link;
+                root.streamHealthState = "starting";
+                root.streamHealthText = "Starting prepared stream\u2026";
+                root.streamHealthPolls = 0;
+                root.statusText = root.streamHealthText;
+                root.clearPrefetch(false);
+                root._launch(args, link, subLabel);
+            } else {
+                root._warmAndLaunch(args, link, subLabel);
+            }
+        } else {
             root._launch(args, link, subLabel);
+        }
     }
 
     // mpv falls back to the raw stream URL for its window title, which is
@@ -2003,8 +2056,11 @@ Panel {
             "--force-window=immediate",
             "--no-terminal",
             "--cache=yes",
-            "--cache-on-disk=yes",
-            "--demuxer-cache-dir=" + root.mpvCacheDir,
+            // Kept in RAM. The streaming cache already writes every one of
+            // these bytes to the NVMe; mirroring them into a second on-disk
+            // buffer doubled the write load during decode and mpv discards
+            // that copy at exit anyway. demuxer-max-bytes below is the real
+            // buffer, and 512 MiB is affordable in a 16 GB machine.
             "--cache-pause=yes",
             // Deliberately kept on. On a 17 Mbit/s link, starting instantly and
             // then stalling feels worse than waiting a moment for a buffer.
@@ -2023,9 +2079,14 @@ Panel {
             // A VO list, not a single name: if gpu-next cannot initialise on
             // this session mpv falls back to gpu instead of refusing to start.
             "--vo=gpu-next,gpu",
+            // This pair is what actually bounds the readahead. cache-secs
+            // defaults to 3600000, so it always wins the "larger value"
+            // override against demuxer-readahead-secs and leaves the byte
+            // budget in charge: ~400s of a 10 Mbit/s 1080p stream, ~50s of
+            // an 80 Mbit/s 4K remux. Do not set cache-secs to a small number
+            // to "increase" the buffer - it can only shrink it.
             "--demuxer-max-bytes=512MiB",
             "--demuxer-max-back-bytes=128MiB",
-            "--demuxer-readahead-secs=600",
             "--hr-seek=yes",
             // A slow swarm needs longer than ten seconds to produce the first
             // bytes. This is how long mpv will keep trying before giving up.
@@ -2123,6 +2184,7 @@ Panel {
     }
 
     function clearPlaybackSession() {
+        root.resetPlaybackMetrics();
         root.overlaySent = "";
         root.loadingSent = "";
         root.introFetched = "";
@@ -2153,8 +2215,160 @@ Panel {
         root.resetNextEpisode();
     }
 
+    // ---- stream prefetch ---------------------------------------------------
+    // Creating the engine, announcing to trackers and finding peers that will
+    // actually unchoke takes seconds, and today all of it starts on the Play
+    // click. Selecting a row is a separate action here, so that work can run
+    // while the list is still being read. Only ever the selected row: warming
+    // a whole list would spend real bandwidth on streams never played.
+
+    function currentStreamLink() {
+        if (root.selStream < 0 || root.selStream >= root.streams.length) return "";
+        var s = root.streams[root.selStream];
+        if (!s || s.streamKind !== "p2p") return "";
+        return s.resourceLink || "";
+    }
+
+    function schedulePrefetch() {
+        if (root.settings.prefetchStreams !== true) return;
+        if (root.playing || root.streamConnecting) return;
+        if (root.currentProvider !== "stremio") return;
+        if (!root.currentStreamLink()) return;
+        streamWarmDebounce.restart();
+    }
+
+    // Hand engines back through a queue. A single Process cannot take a second
+    // command while it is running - the assignment is simply dropped - so
+    // releases fired faster than they complete used to be lost, which on a
+    // metered connection means a swarm left running for a row merely glanced
+    // at. Nothing that is playing or currently warming is ever released.
+    // The release route removes a whole torrent engine, not one file within
+    // it, so protection is compared by info hash. Two picker rows pointing at
+    // different files of the same torrent share one engine, and releasing
+    // either would tear the other down.
+    function infoHashOf(link) {
+        var found = /\/([0-9a-fA-F]{40})(?:\/|$|\?)/.exec(String(link || ""));
+        return found ? found[1].toLowerCase() : "";
+    }
+
+    function releasePrefetch(link) {
+        if (!link || !root.infoHashOf(link)) return;
+        if (root.releaseQueue.indexOf(link) >= 0) return;
+        var queued = root.releaseQueue.slice();
+        queued.push(link);
+        root.releaseQueue = queued;
+        root.drainReleaseQueue();
+    }
+
+    function drainReleaseQueue() {
+        if (streamReleaseProc.running || root.releaseQueue.length === 0) return;
+        // Guarded at the moment of sending rather than when queued. The warm
+        // in flight matters most: its own range request would recreate the
+        // engine moments after we removed it, leaving an orphan running.
+        var guarded = ({});
+        var protect = function(url) {
+            var hash = root.infoHashOf(url);
+            if (hash) guarded[hash] = true;
+        };
+        protect(root.streamHealthUrl);
+        protect(root.prefetchLink);
+        protect(streamWarmProc.activeLink);
+
+        var queued = root.releaseQueue.slice();
+        for (var i = 0; i < queued.length; i++) {
+            if (guarded[root.infoHashOf(queued[i])]) continue;
+            var link = queued[i];
+            queued.splice(i, 1);
+            root.releaseQueue = queued;
+            streamReleaseProc.command = [root.bridge,
+                JSON.stringify({ cmd: "release_stream", url: link })];
+            streamReleaseProc.running = true;
+            return;
+        }
+        // Everything still queued is in use. Left in place deliberately: the
+        // next warm or release exit drains again once the guard has lifted.
+    }
+
+    // Every warm carries the generation it was issued under. A reply whose
+    // generation has moved on belongs to a row the user already left, so it
+    // must not mark the current row ready.
+    function runPrefetch() {
+        var link = root.currentStreamLink();
+        if (!link) return;
+        if (root.playing || root.streamConnecting) return;
+        if (link === root.prefetchLink && root.prefetchState !== "idle") return;
+        root.prefetchGen++;
+        root.prefetchLink = link;
+        root.prefetchState = "warming";
+        if (streamWarmProc.running) {
+            // Cannot retask a running Process; start this one when it exits.
+            root.pendingWarmLink = link;
+            return;
+        }
+        root.startWarm(link, root.prefetchGen);
+    }
+
+    function startWarm(link, generation) {
+        streamWarmProc.generation = generation;
+        streamWarmProc.activeLink = link;
+        streamWarmProc.collected = "";
+        streamWarmProc.command = [root.bridge,
+            JSON.stringify({ cmd: "warm_stream", url: link })];
+        streamWarmProc.running = true;
+    }
+
+    function clearPrefetch(release) {
+        streamWarmDebounce.stop();
+        var link = root.prefetchLink;
+        // Bumping the generation orphans any warm still in flight, so its
+        // reply cannot mark a stream we are no longer interested in ready.
+        root.prefetchGen++;
+        root.pendingWarmLink = "";
+        root.prefetchLink = "";
+        root.prefetchState = "idle";
+        if (release) root.releasePrefetch(link);
+    }
+
+    onSelStreamChanged: {
+        if (root.prefetchLink && root.currentStreamLink() !== root.prefetchLink)
+            root.clearPrefetch(true);
+        root.schedulePrefetch();
+    }
+
+    function resetPlaybackMetrics() {
+        root.metricPlayClickMs = 0;
+        root.metricEngineReadyMs = 0;
+        root.metricMpvLaunchMs = 0;
+        root.metricFirstFrameMs = 0;
+        root.metricRebuffers = 0;
+        root.metricStartupPolls = 0;
+        root.metricRebufferMs = 0;
+        root.metricStarvedSinceMs = 0;
+        root.bufferAheadSecs = 0;
+        root.cacheSpeedBps = 0;
+    }
+
+    // One line per playback, so a slow start can be attributed to a phase
+    // rather than guessed at. Every span is relative to the Play click.
+    function logPlaybackMetrics(reason) {
+        if (root.metricPlayClickMs <= 0) return;
+        var span = function(ms) {
+            return ms > 0 ? (((ms - root.metricPlayClickMs) / 1000).toFixed(2) + "s") : "n/a";
+        };
+        console.log("OmaCine playback [" + reason + "]"
+                  + " engine=" + span(root.metricEngineReadyMs)
+                  + " mpv=" + span(root.metricMpvLaunchMs)
+                  + " firstFrame=" + span(root.metricFirstFrameMs)
+                  + " rebuffers=" + root.metricRebuffers
+                  + " rebufferTotal=" + (root.metricRebufferMs / 1000).toFixed(2) + "s"
+                  + " bufferAhead=" + root.bufferAheadSecs.toFixed(1) + "s"
+                  + " watched=" + root.playbackPosition.toFixed(0) + "s");
+    }
+
     function _warmAndLaunch(args, link, subLabel) {
         if (root.streamConnecting || root.playing) return;
+        root.resetPlaybackMetrics();
+        root.metricPlayClickMs = Date.now();
         root.streamConnecting = true;
         root.streamHealthUrl = link;
         root.streamHealthState = "starting";
@@ -2170,8 +2384,29 @@ Panel {
         warmupFallback.restart();
     }
 
+    // Play pressed while the picker's warm is still running. Set up exactly
+    // the state _warmAndLaunch would, but spawn nothing: streamWarmProc's exit
+    // completes it. Without this, Play started a second warm_stream for a URL
+    // already being warmed.
+    function _adoptWarmAndLaunch(args, link, subLabel) {
+        if (root.streamConnecting || root.playing) return;
+        root.resetPlaybackMetrics();
+        root.metricPlayClickMs = Date.now();
+        root.streamConnecting = true;
+        root.streamHealthUrl = link;
+        root.streamHealthState = "starting";
+        root.streamHealthText = "Finishing the prepared stream\u2026";
+        root.streamHealthPolls = 0;
+        root.statusText = root.streamHealthText;
+        root.warmupArgs = args;
+        root.warmupLink = link;
+        root.warmupLabel = subLabel;
+        warmupFallback.restart();
+    }
+
     function _completeWarmup() {
         if (!root.streamConnecting) return;
+        root.metricEngineReadyMs = Date.now();
         warmupFallback.stop();
         var args = root.warmupArgs;
         var link = root.warmupLink;
@@ -2187,6 +2422,7 @@ Panel {
         args.push(link);
         mpvProc.command = args;
         mpvProc.running = true;
+        root.metricMpvLaunchMs = Date.now();
         root.playing = true;
         if (!root.streamHealthUrl) root.statusText = "Playing in mpv" + subLabel + " \u2022 close the player to stop";
         if (root.mpvSocketPath) Qt.callLater(function(){ root.prepareNextEpisode(); });
@@ -2222,10 +2458,16 @@ Panel {
             root.streamHealthText = "Ready from local cache" + (sources > 0 ? (" • " + sources + " sources connected") : "");
         } else if (rate > 0) {
             root.streamHealthState = "receiving";
+            // bufferAhead is what actually decides whether playback stalls;
+            // progressText counts pieces held anywhere in the file and can
+            // look healthy while the next piece needed is still missing.
             root.streamHealthText = "Receiving media • "
                                   + sources + (sources === 1 ? " source" : " sources")
                                   + (active > 0 ? (" • " + active + " active") : "")
                                   + " • " + root.fmtRate(rate)
+                                  + (root.playing && root.bufferAheadSecs > 0
+                                        ? (" • " + root.bufferAheadSecs.toFixed(0) + "s buffered")
+                                        : "")
                                   + (progressText ? (" • " + progressText) : "");
         } else if (sources > 0) {
             root.streamHealthState = "connected";
@@ -2339,6 +2581,25 @@ Panel {
         root.mpvPlaylistPosition = Number(state["playlist-pos"] !== undefined ? state["playlist-pos"] : -1);
         root.playbackPosition = Math.max(0, Number(state["time-pos"] || 0));
         root.playbackDuration = Math.max(0, Number(state.duration || 0));
+        root.bufferAheadSecs = Math.max(0, Number(state["demuxer-cache-duration"] || 0));
+        root.cacheSpeedBps = Math.max(0, Number(state["cache-speed"] || 0));
+        // A decoded position is the first thing mpv can only report once a
+        // frame exists, so it stands in for first frame without a second IPC.
+        if (root.metricFirstFrameMs <= 0 && root.playbackPosition > 0) {
+            root.metricFirstFrameMs = Date.now();
+            root.logPlaybackMetrics("first-frame");
+        }
+        // Rebuffering is only counted after the first frame: the initial fill
+        // is cache-pause-initial doing its job, not a stall.
+        var starved = state["paused-for-cache"] === true;
+        if (starved && root.metricStarvedSinceMs <= 0) {
+            root.metricStarvedSinceMs = Date.now();
+            if (root.metricFirstFrameMs > 0) root.metricRebuffers++;
+        } else if (!starved && root.metricStarvedSinceMs > 0) {
+            if (root.metricFirstFrameMs > 0)
+                root.metricRebufferMs += Date.now() - root.metricStarvedSinceMs;
+            root.metricStarvedSinceMs = 0;
+        }
         if (root.playbackPosition > 0 && Date.now() - root.lastWatchSaveMs >= 5000) root.queueWatchSave(false);
         var nextLink = root.nextEpisodeCandidate ? (root.nextEpisodeCandidate.resourceLink || "") : "";
         if (nextLink && state.path === nextLink && !root.nextEpisodeTransitioned) {
@@ -2494,11 +2755,27 @@ Panel {
     }
 
     Timer {
-        interval: root.nextEpisodeQueued ? 1000 : 5000
+        // Tiered, because every poll spawns a bridge process. Fast until the
+        // first frame lands (a bounded handful of polls, and the number we
+        // actually care about), then one second through the opening minute
+        // where rebuffering clusters, then back off. playbackPosition is the
+        // reactive term: Date.now() in a binding would never re-evaluate.
+        interval: root.metricFirstFrameMs <= 0
+                    ? (root.metricStartupPolls < 100 ? 300 : 2000)
+                    : (root.playbackPosition < 60 ? 1000
+                                                  : (root.nextEpisodeQueued ? 1000 : 5000))
         repeat: true
         running: root.playing && root.mpvSocketPath !== ""
         triggeredOnStart: true
-        onTriggered: root.pollMpvState()
+        onTriggered: {
+            // Counted here rather than derived from a clock: a Date.now()
+            // binding would never re-evaluate. 100 polls is about 30s of
+            // waiting, after which a stream that has produced no frame is
+            // not going to be helped by asking five times a second.
+            if (root.playing && root.metricFirstFrameMs <= 0 && root.metricStartupPolls < 100)
+                root.metricStartupPolls++;
+            root.pollMpvState();
+        }
     }
 
     Process {
@@ -2582,6 +2859,58 @@ Panel {
         onTriggered: root._completeWarmup()
     }
 
+    // Long enough that arrowing through rows does not start an engine per row,
+    // short enough to still cover the pause before Play is pressed.
+    Timer {
+        id: streamWarmDebounce
+        interval: 350
+        repeat: false
+        onTriggered: root.runPrefetch()
+    }
+
+    Process {
+        id: streamWarmProc
+        property int generation: -1
+        // The link this process is warming right now. Its release must wait
+        // until the range request finishes, or the request recreates the
+        // engine we just removed.
+        property string activeLink: ""
+        property string collected: ""
+        stdout: SplitParser { onRead: function(data){ streamWarmProc.collected += data } }
+        onExited: function(){
+            // Only a reply from the current generation may set state: an older
+            // one belongs to a row the selection has already moved past.
+            if (streamWarmProc.generation === root.prefetchGen) {
+                var ready = false;
+                try {
+                    var resp = JSON.parse(streamWarmProc.collected);
+                    ready = !!(resp && resp.ok && resp.value && resp.value.ready === true);
+                } catch (e) { ready = false; }
+                root.prefetchState = ready ? "ready" : "cold";
+                // Play was pressed while this warm was still in flight and
+                // adopted it rather than starting a second one, so this reply
+                // is what _completeWarmup has been waiting for.
+                if (root.streamConnecting && root.warmupLink !== ""
+                        && root.warmupLink === root.prefetchLink)
+                    root._completeWarmup();
+            }
+            streamWarmProc.activeLink = "";
+            if (root.pendingWarmLink) {
+                var next = root.pendingWarmLink;
+                root.pendingWarmLink = "";
+                if (next === root.prefetchLink) root.startWarm(next, root.prefetchGen);
+            }
+            // Only now can a link this process was warming be released.
+            root.drainReleaseQueue();
+        }
+    }
+
+    // Drains the release queue one engine at a time.
+    Process {
+        id: streamReleaseProc
+        onExited: function(){ root.drainReleaseQueue(); }
+    }
+
     // Theme song playback. Separate from the film player on purpose: it must
     // never share state with it, and killing it must never touch a stream.
     Process {
@@ -2660,6 +2989,8 @@ Panel {
     Process {
         id: mpvProc
         onExited: function() {
+            root.logPlaybackMetrics("closed");
+            root.clearPrefetch(false);
             root.queueWatchSave(false);
             root.playing = false;
             root.streamHealthUrl = "";
@@ -3377,6 +3708,10 @@ Panel {
 
     function close() {
         root.stopTheme();
+        // close() hides the controller without changing root.view, so the
+        // onViewChanged cleanup never fires here: release explicitly or a
+        // prefetched swarm keeps running behind a closed panel.
+        if (!root.playing) root.clearPrefetch(true);
         // Lighting belongs to OmaCine being open, not to the process outliving
         // it: closing the panel puts the LEDs back however they were.
         root.stopAmbient();
@@ -4121,6 +4456,22 @@ Panel {
                         selected: root.settings.railHoverPreview === true
                         enabled: !root.settingsBusy
                         onClicked: root.updateSetting("railHoverPreview", root.settings.railHoverPreview !== true)
+                    }
+                    Button {
+                        text: (root.settings.prefetchStreams === true ? "\u2713  " : "") + "Prepare stream"
+                        tooltipText: "Connect to the chosen stream's sources while you are still "
+                                   + "picking, so Play starts sooner. Costs up to a megabyte for "
+                                   + "a stream you do not end up watching."
+                        selected: root.settings.prefetchStreams === true
+                        enabled: !root.settingsBusy
+                        onClicked: {
+                            var next = root.settings.prefetchStreams !== true;
+                            root.updateSetting("prefetchStreams", next);
+                            // Turning it off should also hand back the engine
+                            // a prefetch has already started, not just stop
+                            // starting new ones.
+                            if (!next) root.clearPrefetch(true);
+                        }
                     }
                     Button {
                         text: (root.settings.themeVideo === true ? "\u2713  " : "") + "Video backdrops"

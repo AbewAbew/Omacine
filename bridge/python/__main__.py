@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 # Make imports work for both:
 #   python3 /path/bridge/python/__main__.py
@@ -271,6 +272,11 @@ SETTINGS_SCHEMA = {
     # Ambient keyboard/underglow lighting during playback. Off by default: it
     # drives the laptop's LEDs, which is not something to switch on unasked.
     "cinematicMode":     (False, None, None),
+    # Start the chosen stream's torrent engine while the picker is still open,
+    # so peer discovery overlaps with choosing instead of following it. Costs
+    # up to a megabyte for a stream that is then not played, which is why it
+    # can be turned off on a metered connection.
+    "prefetchStreams":   (True, None, None),
 }
 
 
@@ -361,7 +367,7 @@ def cache_usage() -> dict:
                         "budget": budgets.get(name, 0) if sized else 0})
     # The torrent cache belongs to the streaming server, not to us; it is
     # reported so one screen shows the whole disk footprint.
-    torrent = Path.home() / ".stremio-server"
+    torrent = Path.home() / ".local" / "share" / "omamovie" / "server"
     entries.append({"name": "torrent", "path": str(torrent), "bytes": _dir_bytes(torrent),
                     "budget": int(settings["cacheTorrentGB"]) * 1024 * 1024 * 1024})
     return {"caches": entries}
@@ -777,7 +783,12 @@ def run(cmd: str, req: dict):
 
     elif cmd == "mpv_status":
         socket_path = _validated_mpv_socket(req.get("socketPath"))
-        properties = ("path", "playlist-pos", "playlist-count", "time-pos", "time-remaining", "duration", "pause", "idle-active")
+        # demuxer-cache-duration is the honest buffer number: seconds of
+        # contiguous content ahead of the playhead. The torrent engine's
+        # streamProgress counts pieces anywhere in the file, so it can read
+        # "cached" while the very next piece needed is still missing.
+        properties = ("path", "playlist-pos", "playlist-count", "time-pos", "time-remaining", "duration", "pause", "idle-active",
+                      "paused-for-cache", "demuxer-cache-duration", "cache-speed")
         try:
             responses = _mpv_exchange(socket_path, [["get_property", name] for name in properties])
         except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError):
@@ -797,6 +808,12 @@ def run(cmd: str, req: dict):
         if errors:
             raise RuntimeError("player rejected command: " + str(errors[0]))
         return {"value": {"accepted": len(responses)}}
+
+    elif cmd == "release_stream":
+        url = str_arg(req, "url")
+        if not url:
+            raise ValueError("missing url")
+        return {"value": stremio.release_stream(url), "provider": "stremio"}
 
     elif cmd == "warm_stream":
         url = str_arg(req, "url")
@@ -1137,6 +1154,39 @@ def run(cmd: str, req: dict):
 _STREAM_MEMO: dict = {}
 
 
+def _retarget_local_streams(items: list) -> list:
+    """Point cached loopback links at the streaming server we run today.
+
+    A cached list stores absolute http://127.0.0.1:<port>/... links. OmaCine
+    moved off Stremio Enhanced's 11470 onto its own port, so any list cached
+    before that move hands mpv a URL nothing is listening on and playback
+    fails with "Could not load this stream". The rest of the entry is still
+    perfectly good, so rewrite the origin on read instead of discarding it.
+    """
+    try:
+        cfg = stremio.load_config()
+        server = stremio._safe_url(cfg.get("streamingServer")) or stremio.DEFAULT_SERVER
+    except Exception:
+        server = stremio.DEFAULT_SERVER
+    wanted = urlparse(server)
+    if wanted.scheme != "http" or not wanted.netloc:
+        return items
+    origin = f"{wanted.scheme}://{wanted.netloc}"
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        link = item.get("resourceLink")
+        if not isinstance(link, str) or not link:
+            continue
+        bits = urlparse(link)
+        if bits.hostname not in ("127.0.0.1", "localhost", "::1"):
+            continue
+        current = f"{bits.scheme}://{bits.netloc}"
+        if current != origin:
+            item["resourceLink"] = origin + link[len(current):]
+    return items
+
+
 def stremio_streams_cached(media_id: str, season: int, episode: int) -> list:
     """Cache the assembled stream list, not just the add-on HTTP responses.
 
@@ -1148,12 +1198,13 @@ def stremio_streams_cached(media_id: str, season: int, episode: int) -> list:
     key = (media_id, int(season), int(episode))
     hit = _STREAM_MEMO.get(key)
     if hit is not None and time.time() - hit[0] < 1800:
-        return hit[1]
+        return _retarget_local_streams(hit[1])
 
     stored = get_provider_stream_cache("stremio", media_id, season, episode)
     if isinstance(stored, dict) and isinstance(stored.get("list"), list):
-        _STREAM_MEMO[key] = (time.time(), stored["list"])
-        return stored["list"]
+        cached = _retarget_local_streams(stored["list"])
+        _STREAM_MEMO[key] = (time.time(), cached)
+        return cached
 
     items = stremio.streams(media_id, season, episode)
     if items:

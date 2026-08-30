@@ -15,7 +15,7 @@ OmaCine is a cinematic, theme-native Quickshell media hub for discovery, persona
 - **High-quality fallback** — 4KHDHub exposes available 2160p/1080p releases, audio labels and multiple mirrors
 - **Catalog protocol** — compatible manifest, catalog, metadata and stream responses with direct and community-hosted media sources
 - **Open ID resolvers** — add HTTPS resolver manifests to bridge catalog and stream ID namespaces without executable plugins
-- **Persistent cache** — the bundled Stremio Enhanced service keeps up to 10 GB under `~/.stremio-server/stremio-cache`; mpv reads up to 512 MiB ahead while paused
+- **Persistent cache** — OmaCine's own streaming service keeps up to 10 GB under `~/.local/share/omamovie/server/stremio-cache`; mpv reads up to 512 MiB ahead in memory while paused
 - **Verified** — `py_compile` + crypto unit tests on `push/PR` only (no release artifacts)
 
 ## Install
@@ -108,13 +108,13 @@ A resolver is plain JSON and runs no code:
 
 For a series, OmaCine resolves the base series ID and then appends `:season:episode` for the stream request. URLs must use HTTPS, except localhost HTTP for development. IDs are literal—wildcards and executable transforms are deliberately unsupported. The complete public-domain template is at `examples/public-domain-resolver/resolver.json`; host that directory on HTTPS when testing the Add resolver flow.
 
-The setup enables the existing `omamovie-stremio-server.service` compatibility unit. Internal paths retain the old identifier so upgrades preserve library, settings and cached media. Check it with:
+The setup enables the `omamovie-stremio-server.service` unit. It runs OmaCine's own copy of the streaming server, vendored under `~/.local/share/omamovie/server/streamingserver/` and patched to listen on **11480**. Stremio Enhanced keeps 11470 and its own settings and cache, so either can be installed, upgraded or removed without disturbing the other, and both can run at the same time. The unit name is unchanged so existing installs keep working. Check it with:
 
 ```bash
 systemctl --user status omamovie-stremio-server.service
 ```
 
-Downloaded media pieces survive pause, player exit, and reboot until the 10 GB cache needs space. mpv's separate pause/read-ahead files live under `~/.cache/omamovie/mpv-cache` and are temporary.
+Downloaded media pieces survive pause, player exit, and reboot until the 10 GB cache needs space. mpv's own read-ahead is held in memory rather than on disk, so it adds no second copy of what the cache already stores.
 
 The 4KHDHub provider needs Python `requests` (`python -c 'import requests'`). MovieBox retains its standard-library fallback.
 

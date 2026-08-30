@@ -41,10 +41,15 @@ class MdblistTests(unittest.TestCase):
         self.assertEqual(r["tomatoesAudience"], 96)
 
     def test_our_id_shapes_map_to_mdblist_paths(self):
-        self.assertEqual(mdblist._media_parts("series|tmdb:108978"), ("show", "108978"))
-        self.assertEqual(mdblist._media_parts("movie|tmdb:550"), ("movie", "550"))
-        self.assertEqual(mdblist._media_parts("108978", "series"), ("show", "108978"))
-        for bad in ("", "tt9288030", "series|imdb:tt1"):
+        self.assertEqual(mdblist._media_parts("series|tmdb:108978"), ("show", "108978", "tmdb"))
+        self.assertEqual(mdblist._media_parts("movie|tmdb:550"), ("movie", "550", "tmdb"))
+        self.assertEqual(mdblist._media_parts("108978", "series"), ("show", "108978", "tmdb"))
+        # Cinemeta and several other Stremio addons carry IMDb ids rather than
+        # TMDB ones, and MDbList indexes both under different path prefixes.
+        self.assertEqual(mdblist._media_parts("series|tt36303968"), ("show", "tt36303968", "imdb"))
+        self.assertEqual(mdblist._media_parts("tt9288030"), ("movie", "tt9288030", "imdb"))
+        # "tt1" is too short to be a real IMDb id, so it is still rejected.
+        for bad in ("", "series|imdb:tt1"):
             with self.assertRaises(ValueError):
                 mdblist._media_parts(bad)
 

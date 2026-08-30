@@ -31,7 +31,9 @@ HTTP_CACHE_MAX_AGE = 24 * 60 * 60
 HTTP_CACHE_PRUNE_INTERVAL = 6 * 60 * 60
 DEFAULT_METADATA = ""
 PUBLIC_DOMAIN_MANIFEST = "https://caching.stremio.net/publicdomainmovies.now.sh/manifest.json"
-DEFAULT_SERVER = "http://127.0.0.1:11470"
+# OmaCine runs its own copy of the streaming server on 11480. Stremio
+# Enhanced keeps 11470, so both can be installed and run at once.
+DEFAULT_SERVER = "http://127.0.0.1:11480"
 SINTEL_CATALOG_ID = "omamovie:catalog:sintel"
 SINTEL_ID = "omamovie:free:sintel"
 SINTEL_HASH = "08ada5a7a6183aae1e09d831df6748d566095a10"
@@ -63,7 +65,7 @@ def default_config() -> dict:
             },
             {
                 "name": "Stremio Local Files",
-                "manifestUrl": "http://127.0.0.1:11470/local-addon/manifest.json",
+                "manifestUrl": "http://127.0.0.1:11480/local-addon/manifest.json",
                 "enabled": True,
             },
         ],
@@ -983,6 +985,39 @@ def warm_stream(url: str) -> dict:
         "headBytes": content_length,
         "priorityWindowBytes": max(1048577, int(content_length * 0.05)) if content_length else 1048577,
     }
+
+
+def release_stream(url: str) -> dict:
+    """Tear down an engine a prefetch started that the user did not play.
+
+    Best effort by design: an engine that has already gone, or a server that
+    refuses the call, must never surface as an error. The caller is cleaning
+    up after itself, not asking the server for something it needs.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+        raise ValueError("only local streams can be released")
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 2 or not re.fullmatch(r"[0-9a-fA-F]{40}", parts[0]):
+        raise ValueError("invalid local stream URL")
+    try:
+        int(parts[1])
+    except ValueError as exc:
+        raise ValueError("invalid local stream file") from exc
+    info_hash = parts[0].lower()
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    # /:infoHash/remove is EngineFS's own engine teardown. Note that
+    # /:id/destroy belongs to the HLS converter router, not to engines: it
+    # answers 200 for an id it does not know and leaves the swarm running.
+    for path in (f"/{info_hash}/remove",):
+        try:
+            request = Request(base + path, headers={"User-Agent": "OmaCine/2.0"}, method="GET")
+            with urlopen(request, timeout=2.0) as response:
+                if 200 <= getattr(response, "status", 0) < 300:
+                    return {"released": True}
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError):
+            continue
+    return {"released": False}
 
 
 def stream_status(url: str) -> dict:
