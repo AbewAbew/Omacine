@@ -532,7 +532,9 @@ class ResolverTests(unittest.TestCase):
         self.assertEqual(ranges[0], "bytes=0-1048576")
         self.assertEqual(ranges[1], f"bytes={total - tail}-{total - 1}")
         self.assertTrue(result["tailReady"])
+        self.assertTrue(result["tailAttempted"])
         self.assertEqual(result["tailBytes"], tail)
+        self.assertEqual(result["tailExpectedBytes"], tail)
 
     def test_warm_stream_reports_an_unreachable_tail(self):
         # The real failure: head cached and instant, tail unavailable, so
@@ -569,6 +571,37 @@ class ResolverTests(unittest.TestCase):
         self.assertFalse(result["tailReady"])     # the part that blocks start
         self.assertEqual(result["tailBytes"], 0)
 
+    def test_partial_tail_is_not_reported_ready(self):
+        # A first chunk can arrive while the actual end of file - where the
+        # index lives - is still missing, so anything short of the whole
+        # requested range counts as not ready.
+        class Partial:
+            def __init__(self, method, head):
+                self.headers = {"Content-Length": str(100 * 1024 * 1024)}
+                self._left = 0 if method == "HEAD" else (1 << 30 if head else 4096)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, count):
+                take = min(count, self._left)
+                self._left -= take
+                return b"x" * take
+
+        def fake_open(request, timeout):
+            rng = request.get_header("Range") or ""
+            return Partial(request.get_method(), rng.startswith("bytes=0-"))
+
+        with patch.object(stremio, "urlopen", side_effect=fake_open):
+            result = stremio.warm_stream("http://127.0.0.1:11480/example/0")
+
+        self.assertEqual(result["tailBytes"], 4096)
+        self.assertTrue(result["tailAttempted"])
+        self.assertFalse(result["tailReady"])
+
     def test_warm_stream_skips_the_tail_on_a_tiny_file(self):
         # Nothing to split: head and tail would overlap.
         class Tiny:
@@ -585,7 +618,10 @@ class ResolverTests(unittest.TestCase):
 
         with patch.object(stremio, "urlopen", side_effect=lambda r, timeout: Tiny()):
             result = stremio.warm_stream("http://127.0.0.1:11480/example/0")
+        # Nothing was asked for, so this is "not applicable", not "missing".
         self.assertEqual(result["tailBytes"], 0)
+        self.assertFalse(result["tailAttempted"])
+        self.assertEqual(result["tailExpectedBytes"], 0)
 
     def test_release_stream_uses_the_engine_remove_route(self):
         raw_hash = "0123456789abcdef0123456789abcdef01234567"

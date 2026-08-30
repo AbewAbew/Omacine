@@ -134,11 +134,20 @@ Panel {
     // idle | warming | ready | cold. "cold" means the warm completed but the
     // swarm produced no bytes in time, which is exactly when Play still needs
     // the full warm-and-launch rather than the shortcut.
-    // Whether the last warm managed to read the file's tail. False does not
-    // mean broken - it usually means "not downloaded yet" - but a stream that
-    // also never produces a frame is waiting on its seek index, and saying so
-    // beats a black screen under a reassuring "86% cached".
-    property bool warmTailReady: true
+    // unknown | ready | missing, for the stream currently being started.
+    // Tri-state on purpose: a plain boolean carried a failed tail from one
+    // stream into the next, so a fresh stream could show the seek-index
+    // message before its own warm had even replied. Only "missing" - this
+    // stream was asked for its tail and did not get it - says anything.
+    property string warmTailState: "unknown"
+    // The next episode is warmed while the current one plays, so its result
+    // needs somewhere of its own to live until the transition.
+    property string nextWarmTailState: "unknown"
+
+    function tailStateFrom(value) {
+        if (!value || value.tailAttempted !== true) return "unknown";
+        return value.tailReady === true ? "ready" : "missing";
+    }
     property string prefetchState: "idle"
     property int prefetchGen: 0
     property string pendingWarmLink: ""
@@ -2207,6 +2216,8 @@ Panel {
 
     function clearPlaybackSession() {
         root.resetPlaybackMetrics();
+        root.warmTailState = "unknown";
+        root.nextWarmTailState = "unknown";
         root.overlaySent = "";
         root.loadingSent = "";
         root.introFetched = "";
@@ -2322,6 +2333,7 @@ Panel {
         root.prefetchGen++;
         root.prefetchLink = link;
         root.prefetchState = "warming";
+        root.warmTailState = "unknown";
         if (streamWarmProc.running) {
             // Cannot retask a running Process; start this one when it exits.
             root.pendingWarmLink = link;
@@ -2390,6 +2402,7 @@ Panel {
     function _warmAndLaunch(args, link, subLabel) {
         if (root.streamConnecting || root.playing) return;
         root.resetPlaybackMetrics();
+        root.warmTailState = "unknown";
         root.metricPlayClickMs = Date.now();
         root.streamConnecting = true;
         root.streamHealthUrl = link;
@@ -2491,14 +2504,14 @@ Panel {
         // MKV keeps the Cues mpv must parse before showing frame one - is
         // still missing. Say that, rather than repeating a number that looks
         // like everything is fine.
-        if (root.playing && !root.warmTailReady && root.metricFirstFrameMs <= 0
+        if (root.playing && root.warmTailState === "missing" && root.metricFirstFrameMs <= 0
                 && root.streamHealthPolls > 12 && progress > 0.4) {
             root.streamHealthState = "indexing";
             root.streamHealthText = "Waiting for this source's seek index \u2014 "
                                   + (progressText ? progressText + ", " : "")
                                   + "but the end of the file is still arriving"
                                   + (sources > 0 ? (" \u2022 " + sources + (sources === 1 ? " source" : " sources")) : "")
-                                  + (rate > 0 ? (" \u2022 " + root.fmtRate(rate)) : " \u2022 stalled, try another source");
+                                  + (rate > 0 ? (" \u2022 " + root.fmtRate(rate)) : "");
             root.statusText = root.streamHealthText;
             return;
         }
@@ -2768,6 +2781,15 @@ Panel {
         root.playbackPosition = 0;
         root.playbackDuration = 0;
         root.lastWatchSaveMs = 0;
+        // Per-file state, so the new episode is measured on its own terms.
+        // Without this metricFirstFrameMs stayed set from the episode just
+        // finished, so the next one could never report a first frame - and
+        // the seek-index check, which requires no frame yet, could never fire.
+        root.logPlaybackMetrics("episode-end");
+        root.resetPlaybackMetrics();
+        root.metricPlayClickMs = Date.now();
+        root.warmTailState = root.nextWarmTailState;
+        root.nextWarmTailState = "unknown";
         if (root.currentId === root.playbackId) {
             root.curSeason = root.playbackSeason;
             root.maxEp = root.episodeCount(root.curSeason);
@@ -2867,6 +2889,11 @@ Panel {
         property string collected: ""
         stdout: SplitParser { onRead: function(data){ nextWarmupProc.collected += data } }
         onExited: function(){
+            try {
+                var resp = JSON.parse(nextWarmupProc.collected);
+                if (resp && resp.ok && resp.value)
+                    root.nextWarmTailState = root.tailStateFrom(resp.value);
+            } catch (e) { }
             if (root.nextEpisodeCandidate)
                 root.upNextText = "Up next: " + root.continuationLabel(root.nextEpisodeCandidate) + " • ready";
         }
@@ -2894,7 +2921,7 @@ Panel {
             try {
                 var resp = JSON.parse(warmupProc.collected);
                 if (resp && resp.ok && resp.value)
-                    root.warmTailReady = resp.value.tailReady !== false;
+                    root.warmTailState = root.tailStateFrom(resp.value);
             } catch (e) { }
             root._completeWarmup();
         }
@@ -2934,7 +2961,7 @@ Panel {
                     var resp = JSON.parse(streamWarmProc.collected);
                     ready = !!(resp && resp.ok && resp.value && resp.value.ready === true);
                     if (resp && resp.ok && resp.value)
-                        root.warmTailReady = resp.value.tailReady !== false;
+                        root.warmTailState = root.tailStateFrom(resp.value);
                 } catch (e) { ready = false; }
                 root.prefetchState = ready ? "ready" : "cold";
                 // Play was pressed while this warm was still in flight and

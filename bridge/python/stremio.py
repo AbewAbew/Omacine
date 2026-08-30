@@ -987,10 +987,16 @@ def warm_stream(url: str) -> dict:
     # The tail matters as much as the head. An MKV keeps its Cues - the
     # keyframe index mpv must read before it can show a single frame - at the
     # end of the file, and a sequential downloader never asks for it. A source
-    # can be 86% cached, serve its head instantly, and still never start
-    # because the last pieces are the ones the swarm cannot supply.
+    # can be 86% cached, serve its head in milliseconds, and still show nothing
+    # because the last pieces have not arrived yet.
+    #
+    # tail_expected is 0 when there is nothing to ask for - HEAD gave no length,
+    # or the file is small enough that head and tail would overlap. That is not
+    # a missing index, so callers are told the tail was never attempted rather
+    # than being told it failed.
+    tail_expected = TAIL_WARM_BYTES if content_length > TAIL_WARM_BYTES * 2 else 0
     tail_received = 0
-    if content_length > TAIL_WARM_BYTES * 2:
+    if tail_expected:
         tail_headers = {**base_headers,
                         "Range": f"bytes={content_length - TAIL_WARM_BYTES}-{content_length - 1}"}
         try:
@@ -1007,10 +1013,12 @@ def warm_stream(url: str) -> dict:
         "bytes": received,
         "headBytes": content_length,
         "tailBytes": tail_received,
-        # False means the seek index could not be read in time. On its own that
-        # only means "not yet"; combined with playback that never produces a
-        # frame it is the signature of a source that will never start.
-        "tailReady": tail_received > 0,
+        "tailExpectedBytes": tail_expected,
+        "tailAttempted": bool(tail_expected),
+        # The whole requested range, not merely a first chunk: a partial read
+        # can stop short of the actual end of file, which is where the index
+        # lives. False means "has not arrived yet", never "will not arrive".
+        "tailReady": bool(tail_expected) and tail_received >= tail_expected,
         "priorityWindowBytes": max(1048577, int(content_length * 0.05)) if content_length else 1048577,
     }
 
