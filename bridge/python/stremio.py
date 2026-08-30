@@ -950,6 +950,11 @@ def _peer_sources(stream: dict, info_hash: str) -> list[str]:
     return out
 
 
+# 256 KiB is comfortably more than an MKV Cues block for a single episode,
+# and small enough that fetching it does not delay the head.
+TAIL_WARM_BYTES = 262144
+
+
 def warm_stream(url: str) -> dict:
     """Prime a loopback stream with a highest-priority head range request."""
     parsed = urlparse(url)
@@ -979,10 +984,33 @@ def warm_stream(url: str) -> dict:
                 received += len(chunk)
     except (HTTPError, URLError, TimeoutError, OSError):
         pass
+    # The tail matters as much as the head. An MKV keeps its Cues - the
+    # keyframe index mpv must read before it can show a single frame - at the
+    # end of the file, and a sequential downloader never asks for it. A source
+    # can be 86% cached, serve its head instantly, and still never start
+    # because the last pieces are the ones the swarm cannot supply.
+    tail_received = 0
+    if content_length > TAIL_WARM_BYTES * 2:
+        tail_headers = {**base_headers,
+                        "Range": f"bytes={content_length - TAIL_WARM_BYTES}-{content_length - 1}"}
+        try:
+            with urlopen(Request(url, headers=tail_headers, method="GET"), timeout=1.5) as response:
+                while tail_received < TAIL_WARM_BYTES:
+                    chunk = response.read(min(65536, TAIL_WARM_BYTES - tail_received))
+                    if not chunk:
+                        break
+                    tail_received += len(chunk)
+        except (HTTPError, URLError, TimeoutError, OSError):
+            pass
     return {
         "ready": received > 0,
         "bytes": received,
         "headBytes": content_length,
+        "tailBytes": tail_received,
+        # False means the seek index could not be read in time. On its own that
+        # only means "not yet"; combined with playback that never produces a
+        # frame it is the signature of a source that will never start.
+        "tailReady": tail_received > 0,
         "priorityWindowBytes": max(1048577, int(content_length * 0.05)) if content_length else 1048577,
     }
 

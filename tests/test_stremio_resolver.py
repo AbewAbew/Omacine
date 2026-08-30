@@ -486,10 +486,106 @@ class ResolverTests(unittest.TestCase):
 
         self.assertTrue(result["ready"])
         self.assertEqual(result["bytes"], 1048577)
-        self.assertEqual([request.get_method() for request, _timeout in requests], ["HEAD", "GET"])
+        # HEAD for the length, then the head range, then the tail range that
+        # carries the MKV seek index.
+        self.assertEqual([request.get_method() for request, _timeout in requests], ["HEAD", "GET", "GET"])
         self.assertEqual(requests[1][0].get_header("Range"), "bytes=0-1048576")
         self.assertEqual(requests[1][0].get_header("Enginefs-prio"), "255")
+        self.assertEqual(requests[2][0].get_header("Range"),
+                         f"bytes={200000000 - stremio.TAIL_WARM_BYTES}-{200000000 - 1}")
+        self.assertEqual(requests[2][0].get_header("Enginefs-prio"), "255")
         self.assertEqual(result["priorityWindowBytes"], 10000000)
+
+    def test_warm_stream_also_fetches_the_tail(self):
+        # An MKV keeps its Cues at the end. Warming only the head leaves the
+        # one thing that blocks first frame un-fetched.
+        ranges = []
+
+        class FakeResponse:
+            def __init__(self, method, length):
+                self._method = method
+                self.headers = {"Content-Length": str(length)}
+                self._left = 0 if method == "HEAD" else 1 << 30
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, count):
+                take = min(count, self._left)
+                self._left -= take
+                return b"x" * take
+
+        def fake_open(request, timeout):
+            rng = request.get_header("Range")
+            if rng:
+                ranges.append(rng)
+            return FakeResponse(request.get_method(), 100 * 1024 * 1024)
+
+        with patch.object(stremio, "urlopen", side_effect=fake_open):
+            result = stremio.warm_stream("http://127.0.0.1:11480/example/0")
+
+        total = 100 * 1024 * 1024
+        tail = stremio.TAIL_WARM_BYTES
+        self.assertEqual(ranges[0], "bytes=0-1048576")
+        self.assertEqual(ranges[1], f"bytes={total - tail}-{total - 1}")
+        self.assertTrue(result["tailReady"])
+        self.assertEqual(result["tailBytes"], tail)
+
+    def test_warm_stream_reports_an_unreachable_tail(self):
+        # The real failure: head cached and instant, tail unavailable, so
+        # playback never starts however high the cached percentage looks.
+        class HeadOnly:
+            def __init__(self, method):
+                self._method = method
+                self.headers = {"Content-Length": str(100 * 1024 * 1024)}
+                self._left = 0 if method == "HEAD" else 1 << 30
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, count):
+                take = min(count, self._left)
+                self._left -= take
+                return b"x" * take
+
+        def fake_open(request, timeout):
+            rng = request.get_header("Range") or ""
+            if rng.startswith("bytes=0-"):
+                return HeadOnly(request.get_method())
+            if request.get_method() == "HEAD":
+                return HeadOnly("HEAD")
+            raise TimeoutError("tail never arrives")
+
+        with patch.object(stremio, "urlopen", side_effect=fake_open):
+            result = stremio.warm_stream("http://127.0.0.1:11480/example/0")
+
+        self.assertTrue(result["ready"])          # head is fine
+        self.assertFalse(result["tailReady"])     # the part that blocks start
+        self.assertEqual(result["tailBytes"], 0)
+
+    def test_warm_stream_skips_the_tail_on_a_tiny_file(self):
+        # Nothing to split: head and tail would overlap.
+        class Tiny:
+            headers = {"Content-Length": "1024"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, count):
+                return b""
+
+        with patch.object(stremio, "urlopen", side_effect=lambda r, timeout: Tiny()):
+            result = stremio.warm_stream("http://127.0.0.1:11480/example/0")
+        self.assertEqual(result["tailBytes"], 0)
 
     def test_release_stream_uses_the_engine_remove_route(self):
         raw_hash = "0123456789abcdef0123456789abcdef01234567"

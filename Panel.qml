@@ -134,6 +134,11 @@ Panel {
     // idle | warming | ready | cold. "cold" means the warm completed but the
     // swarm produced no bytes in time, which is exactly when Play still needs
     // the full warm-and-launch rather than the shortcut.
+    // Whether the last warm managed to read the file's tail. False does not
+    // mean broken - it usually means "not downloaded yet" - but a stream that
+    // also never produces a frame is waiting on its seek index, and saying so
+    // beats a black screen under a reassuring "86% cached".
+    property bool warmTailReady: true
     property string prefetchState: "idle"
     property int prefetchGen: 0
     property string pendingWarmLink: ""
@@ -2480,6 +2485,23 @@ Panel {
         var rate = Number(stats.receiveRate || 0);
         var progress = Number(stats.cachedProgress || 0);
         var progressText = root.cachedPercent(progress);
+        // A high cached percentage with no frame is the signature of a source
+        // whose seek index has not arrived. streamProgress counts pieces held
+        // anywhere in the file, so it can read 86% while the end - where an
+        // MKV keeps the Cues mpv must parse before showing frame one - is
+        // still missing. Say that, rather than repeating a number that looks
+        // like everything is fine.
+        if (root.playing && !root.warmTailReady && root.metricFirstFrameMs <= 0
+                && root.streamHealthPolls > 12 && progress > 0.4) {
+            root.streamHealthState = "indexing";
+            root.streamHealthText = "Waiting for this source's seek index \u2014 "
+                                  + (progressText ? progressText + ", " : "")
+                                  + "but the end of the file is still arriving"
+                                  + (sources > 0 ? (" \u2022 " + sources + (sources === 1 ? " source" : " sources")) : "")
+                                  + (rate > 0 ? (" \u2022 " + root.fmtRate(rate)) : " \u2022 stalled, try another source");
+            root.statusText = root.streamHealthText;
+            return;
+        }
         if (progress >= 0.995) {
             root.streamHealthState = "ready";
             root.streamHealthText = "Ready from local cache" + (sources > 0 ? (" • " + sources + " sources connected") : "");
@@ -2868,7 +2890,14 @@ Panel {
         id: warmupProc
         property string collected: ""
         stdout: SplitParser { onRead: function(data){ warmupProc.collected += data } }
-        onExited: function(){ root._completeWarmup(); }
+        onExited: function(){
+            try {
+                var resp = JSON.parse(warmupProc.collected);
+                if (resp && resp.ok && resp.value)
+                    root.warmTailReady = resp.value.tailReady !== false;
+            } catch (e) { }
+            root._completeWarmup();
+        }
     }
 
     Timer {
@@ -2904,6 +2933,8 @@ Panel {
                 try {
                     var resp = JSON.parse(streamWarmProc.collected);
                     ready = !!(resp && resp.ok && resp.value && resp.value.ready === true);
+                    if (resp && resp.ok && resp.value)
+                        root.warmTailReady = resp.value.tailReady !== false;
                 } catch (e) { ready = false; }
                 root.prefetchState = ready ? "ready" : "cold";
                 // Play was pressed while this warm was still in flight and
